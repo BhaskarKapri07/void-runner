@@ -24,7 +24,7 @@ You can also deploy from the repository's **Deploy Cloudflare backend** GitHub A
 
 `/health` reports readiness and configured hints. `/location` returns request ingress metadata and an observed egress colo from a trace request. Neither field is a contractual proof of the Durable Object's physical location. Measure the lobby's actual RTT with players in India. If strict Mumbai/India compute placement is required, use a provider with an explicit Indian compute region instead.
 
-Location hints apply on first creation. `ARENA_INSTANCE` selects the logical object; changing it creates a fresh arena instance and does not relocate or preserve old rooms. Keep all clients on the same service and instance. This version uses one regional arena object for small-scale casual co-op, capped at 50 authoritative rooms and 50 peer rooms. Active sockets/timers keep the object awake; Cloudflare quotas and usage charges can apply. Runs are in memory and are lost on restart/deployment. Review your account's plan before deployment.
+Location hints apply on first creation. `ARENA_INSTANCE` selects the logical object; changing it creates a fresh arena instance and does not relocate or preserve old rooms. Keep all clients on the same service and instance. This version uses one regional arena object for small-scale casual co-op, capped at 50 authoritative rooms and 50 peer rooms. Active sockets keep the object awake, and its 60 Hz simulation clock runs only while a dedicated-server room exists; Cloudflare quotas and usage charges can apply. Runs are in memory and are lost on restart/deployment. Review your account's plan before deployment.
 
 Cloudflare references:
 - https://developers.cloudflare.com/workers/configuration/placement/
@@ -43,26 +43,39 @@ Download `downloads/voidrunner.html` (or use **Download HTML** in the game heade
 - **Join online:** uses the configured Render service by default; enter a different service in Server connection if desired.
 - **Host direct co-op:** choose Player browser and Create Room. The simulation runs inside this HTML file; Render only introduces the peers. Share the code with friends.
 - Online still needs internet, signaling and possibly TURN. This file does not start a Node/HTTP/WebSocket listening server. For a laptop server use `npm start` and a tunnel as documented below.
-- Keep the host tab visible. Desktop Chromium and Firefox are the intended targets; file-opening behavior varies on mobile.
+- The host's simulation keeps running in a background tab, but the host's own ship stops while its tab is hidden. Desktop Chromium and Firefox are the intended targets; file-opening behavior varies on mobile.
 
 Rebuild after changing game code with `npm run build:client`. The generated HTML is tracked so it can be downloaded from any static host. CI checks that it is current, loads it from a real `file://` URL, and exercises peer connections.
 
 ## Connection modes
 
-**Player browser (default):** one player's browser runs the authoritative simulation. Other browsers exchange controls and snapshots directly with that host via WebRTC data channels. Render handles room discovery and SDP/ICE signaling only; gameplay does not travel through Render. Everyone must choose the same mode. Keep the host tab visible and the laptop awake. If the host leaves, the match ends; host migration is not implemented in direct mode.
+**Player browser (default):** one player's browser runs the authoritative simulation. Other browsers exchange controls and snapshots directly with that host via WebRTC data channels. Render handles room discovery and SDP/ICE signaling only; gameplay does not travel through Render. Everyone must choose the same mode. Once connected, a direct match no longer needs the signaling connection. Keep the host's laptop awake; its simulation keeps running in a background tab. If the host leaves, the match ends; host migration is not implemented in direct mode.
 
 **Dedicated server (fallback):** the Node server runs the same simulation. Choose this when direct peer connections fail, or use a nearby server. The lobby shows measured round-trip latency to the match host, not just the signaling service.
 
 WebRTC still needs signaling and ICE discovery. The default public STUN server helps discover direct routes; some corporate/mobile networks need TURN. No TURN service is bundled. Configure `window.VOIDRUNNER_ICE_SERVERS` with your own ICE servers if needed; never commit long-lived TURN secrets to a public repository. Without TURN, use dedicated-server mode when direct connections fail.
 
-## Responsiveness and combat
+## Netcode
 
-- Local movement runs immediately at 60 Hz, then reconciles authoritative positions by replaying unacknowledged input frames. Inputs carry sequence numbers and run epochs; duplicates and stale-run inputs are ignored.
-- The shared simulation runs at 60 Hz and emits snapshots at 30 Hz. A 75 ms interpolation buffer smooths remote movement and ignores out-of-order snapshots.
-- Local muzzle feedback plays immediately. Damage remains authoritative, not guessed on each client.
-- Swept relative-motion collision checks prevent fast projectiles skipping through targets between ticks.
-- Every hit broadcasts the shooter's color, target, and damage. All players see impact flashes and damage numbers, including nonlethal and splash hits.
-- Prediction cannot remove latency from confirmed damage. This version has no historical server rewind / lag compensation, so a host near the squad still helps.
+The match authority (a player's browser, the Node server, or the Cloudflare Durable Object) simulates at 60 Hz and publishes 30 times a second. Protocol v2 (`shared/protocol.js`) splits what it sends in two:
+
+- **Journal, reliable and sent once:** volleys, enemy shot spreads, projectile removals from hits, hit and explosion effects, and roster or upgrade changes. Projectiles fly in straight lines, so a whole volley is one small entry and each client computes every bullet's position itself.
+- **State, latest only:** ships, enemies and score. Losing one is harmless because the next one replaces it.
+
+Over WebSocket both parts travel in one message. In direct mode the journal uses the reliable data channel and state uses the unreliable one. A client that misses a journal batch asks for a full sync, and an authority that has to skip a batch for a backed-up connection sends one on its own. Each message is encoded once and shared by every player in the room.
+
+Four pilots now need roughly 0.1 to 0.3 Mbit/s each, and that no longer grows with the number of bullets on screen. Protocol v1 sent every entity plus the last 160 effects in every snapshot, which reached about 37 Mbit/s per player late in a run. `npm run bench:net` prints before and after numbers for several builds from the same simulation.
+
+How the client draws the match:
+
+- Your ship moves immediately and reconciles by replaying unacknowledged input frames. Inputs carry sequence numbers and run epochs; duplicates and stale-run inputs are ignored.
+- Your bullets appear the moment you fire. The client runs the authority's exact per-frame cooldown, so the predicted volley is the one the server fires, and it adopts the server's ids when the journal confirms it.
+- Enemies and enemy shots are drawn on your local clock: where they will be when the authority processes your current input. The shots you see reaching you are the ones the authority tests against your ship.
+- Other pilots and their bullets are interpolated. The buffer adapts to measured jitter, from about 50 ms on a clean connection up to 250 ms.
+- Damage stays authoritative. Swept relative-motion collision checks stop fast projectiles skipping through targets between ticks. Every hit still carries the shooter's color, target and damage, so all players see impact flashes and damage numbers.
+- Prediction cannot remove latency from confirmed damage, and there is no server rewind or lag compensation, so a host near the squad still helps.
+
+Clients and authorities compare protocol versions when joining, so an old downloaded `voidrunner.html` gets an "out of date" message instead of a broken match.
 
 ## Host the server on your own laptop
 
@@ -121,12 +134,12 @@ GitHub Pages alone cannot run the multiplayer server. HTTPS pages require secure
 ## Architecture and limits
 
 - The match authority (browser host or server) owns the simulation. Guests send only controls and choices. A browser host is trusted and can modify its own simulation; this is casual co-op, not anti-cheat infrastructure.
-- Guests predict movement and reconcile against the match authority. Remote entities use buffered snapshot interpolation.
+- Guests predict movement and their own volleys, and reconcile against the match authority. Other pilots use buffered snapshot interpolation.
 - Maximum four pilots per room. New joins are lobby-only. Disconnected pilots leave immediately, and an empty room is deleted. Reconnecting into an active run is not implemented.
 - Rooms live in memory on **one server instance**. Server restarts/deploys lose active runs. Do not horizontally scale this version.
 - Room codes are invite codes, not accounts or authentication. Use for casual co-op. Input message limits, payload limits, connection limits, room limits, and heartbeat cleanup are included.
 - Free hosting can sleep when idle. Initial connection may be slow. Runs are not persisted.
-- Solo gameplay remains in `game.js`; online rendering/lobby in `online.js`; shared authoritative gameplay in `shared/engine.js` and peer transport in `peer.js`; HTTP/WebSocket transport in `server/index.js`.
+- Solo gameplay remains in `game.js`; online rendering/lobby in `online.js`; shared authoritative gameplay in `shared/engine.js`, the wire format in `shared/protocol.js` and peer transport in `peer.js`; HTTP/WebSocket transport in `server/index.js`.
 
 ## Tests
 
@@ -134,4 +147,4 @@ GitHub Pages alone cannot run the multiplayer server. HTTPS pages require secure
 npm test
 ```
 
-The suite connects four real WebSocket clients, rejects a fifth, checks host-only launching and handoff, movement and shots, cleanup, revives, upgrades, defeat/restart, boss scaling, stale inputs, and static-file exposure. GitHub Actions runs it on pushes and pull requests. Manual browser playtesting with four people is still recommended.
+The suite connects four real WebSocket clients, rejects a fifth, checks host-only launching and handoff, movement and shots, cleanup, revives, upgrades, defeat/restart, boss scaling, stale inputs, and static-file exposure. Netcode tests hold bandwidth budgets for several builds, check that client-computed projectiles match the authority (also across lost messages and resyncs), and check that local fire prediction matches the authority volley for volley. `npm run test:browser` runs four real browsers in both modes against the Node server and the local Cloudflare runtime. GitHub Actions runs it on pushes and pull requests. Manual browser playtesting with four people is still recommended.

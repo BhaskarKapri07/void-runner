@@ -11,6 +11,7 @@
     "test": "node --test test/*.test.js",
     "test:browser": "playwright test",
     "build:client": "node scripts/build-client.js",
+    "bench:net": "node scripts/netbench.js",
     "deploy:cloudflare": "wrangler deploy",
     "dev:cloudflare": "wrangler dev --local --port 8787",
     "check:cloudflare": "wrangler deploy --dry-run --outdir .cloudflare-build"
