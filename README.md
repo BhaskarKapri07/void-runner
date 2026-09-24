@@ -139,7 +139,22 @@ GitHub Pages alone cannot run the multiplayer server. HTTPS pages require secure
 - Rooms live in memory on **one server instance**. Server restarts/deploys lose active runs. Do not horizontally scale this version.
 - Room codes are invite codes, not accounts or authentication. Use for casual co-op. Input message limits, payload limits, connection limits, room limits, and heartbeat cleanup are included.
 - Free hosting can sleep when idle. Initial connection may be slow. Runs are not persisted.
-- Solo gameplay remains in `game.js`; online rendering/lobby in `online.js`; shared authoritative gameplay in `shared/engine.js`, the wire format in `shared/protocol.js` and peer transport in `peer.js`; HTTP/WebSocket transport in `server/index.js`.
+- Where things live:
+
+  ```text
+  game.js               solo game, plus the canvas helpers the online page reuses
+  online.js             online lobby, HUD, effects and drawing
+  peer.js               direct mode: WebRTC transport; the host runs the match
+  shared/netcode.js     constants and physics shared by authority and client
+  shared/engine.js      the authoritative simulation (Room) and its change journal
+  shared/protocol.js    wire format: message schemas, encoders and decoders
+  shared/match.js       authority fan-out (Match), fixed-step Ticker, pilot commands
+  shared/world.js       client mirror of a match (ClientWorld) and NetClock
+  shared/client.js      MatchClient: prediction, input batching, what to draw
+  server/hub.js         rooms, signaling and message handling for both servers
+  server/index.js       Node HTTP/WebSocket adapter
+  cloudflare/worker.js  Durable Object adapter
+  ```
 
 ## Tests
 

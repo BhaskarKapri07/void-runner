@@ -1,9 +1,10 @@
-// Measures bytes per publish for a four-pilot fight and checks that a client fed those messages
-// reconstructs the authority's projectiles. Run with `npm run bench:net`.
+// Measures what a four-pilot fight costs on the wire and checks that a client fed through the real
+// Match reconstructs the authority's projectiles. Run with `npm run bench:net`.
 import { fileURLToPath } from 'node:url';
 import { Room } from '../shared/engine.js';
 import { STEP, SNAPSHOT_TICKS, bulletAlive, shotAlive } from '../shared/netcode.js';
-import { Broadcaster, ClientWorld } from '../shared/protocol.js';
+import { Match } from '../shared/match.js';
+import { ClientWorld, projectileAt } from '../shared/world.js';
 
 export const BUILDS = {
   fresh: { label: 'Wave 1, no upgrades', wave: 1, build: {} },
@@ -12,79 +13,90 @@ export const BUILDS = {
   swarm: { label: 'Wave 20, no upgrades (swarm)', wave: 20, build: {} },
 };
 
-// The pre-v2 wire format: every entity and the last 160 effects, 30 times a second. Kept only
-// so the benchmark can report before and after from the same simulation.
-function legacySnapshot(room, effects) {
-  return { type: 'state', tick: room.tickId, epoch: room.epoch, code: room.code, host: room.host, phase: room.phase, wave: room.wave, score: room.score, time: room.time,
-    players: room.players.map(({ input, lastInput, queue, budget, lastSeq, commands, ...p }) => p), enemies: room.enemies, bullets: room.bullets.map(({ hit, ...b }) => b), shots: room.shots, events: effects };
+// Protocol v1 sent every entity plus the last 160 effects in every snapshot. Rebuilt here only so the
+// benchmark reports before and after from the same simulation.
+class LegacySnapshot {
+  constructor() { this.effects = []; this.serial = 0; }
+  bytes(room) {
+    for (const e of room.log) {
+      if (e.kind !== 'burst' && e.kind !== 'hit') continue;
+      this.effects.push({ id: ++this.serial, ...e });
+      if (this.effects.length > 160) this.effects.shift();
+    }
+    const players = room.players.map(({ input, lastInput, queue, budget, lastSeq, commands, ...p }) => p);
+    return JSON.stringify({ type: 'state', tick: room.tickId, epoch: room.epoch, code: room.code, host: room.host, phase: room.phase, wave: room.wave, score: room.score, time: room.time,
+      players, enemies: room.enemies, bullets: room.bullets.map(({ hit, ...b }) => b), shots: room.shots, events: this.effects }).length;
+  }
 }
 
-// Deterministic pseudo-random source so budgets and assertions are stable across runs.
-function seeded(seed) { return () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 2 ** 32; }; }
-
-export function simulate({ wave, build }, { seconds = 20, seed = 7, check = false, drop = null } = {}) {
+// Math.random drives spawns and aim; a fixed sequence keeps budgets and assertions stable.
+function withSeed(seed, run) {
   const random = Math.random;
-  Math.random = seeded(seed);
-  try {
+  Math.random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+  try { return run(); } finally { Math.random = random; }
+}
+
+// Runs `seconds` of four immortal pilots holding fire while strafing. `drop(n)` loses the n-th
+// delivery the way a backed-up socket skips a send; the Match must then resync the client.
+export function simulate({ wave, build }, { seconds = 20, seed = 7, check = false, drop = null } = {}) {
+  return withSeed(seed, () => {
     const room = new Room('BENCH1'), players = [0, 1, 2, 3].map(i => room.add('P' + i));
     room.start(room.host);
     room.wave = wave;
-    for (const p of players) { Object.assign(p, build); p.hp = p.max = 999; }
-    const broadcaster = new Broadcaster(room), world = new ClientWorld(), seqs = new Map(players.map(p => [p.id, 0]));
+    for (const p of players) Object.assign(p, build, { hp: 999, max: 999 });
+    const match = new Match(room), world = new ClientWorld(), legacy = new LegacySnapshot();
+    const stats = { bytes: 0, messages: 0, peak: 0, syncs: 0, legacy: 0, enemies: 0, publishes: 0, worst: 0 };
+    let behind = false; // a journal batch was lost and the resync hasn't arrived yet
     world.setMe(players[0].id);
-    world.sync(broadcaster.sync());
-    let total = 0, peak = 0, count = 0, worst = 0, resyncs = 0, legacy = 0, serial = 0, enemies = 0, needSync = false;
-    const effects = [];
-    for (let t = 1; t <= seconds * 60; t++) {
-      for (const p of players) {
-        const seq = seqs.get(p.id) + 1;
-        seqs.set(p.id, seq);
-        room.frames(p.id, [{ seq, input: { fire: true, left: t % 120 < 60, right: t % 120 >= 60 } }], room.epoch);
-      }
+    match.add({
+      deliver(out, full) {
+        if (full) { stats.syncs++; behind = false; world.sync(out.sync); return true; }
+        const bytes = out.json('combined').length;
+        stats.bytes += bytes;
+        stats.peak = Math.max(stats.peak, bytes);
+        stats.messages++;
+        if (drop?.(stats.messages)) { behind ||= !!out.rel; return false; }
+        if (out.rel && !world.rel(out.rel)) throw Error('journal gap on an in-order stream');
+        if (out.state) world.state(out.state);
+        return true;
+      },
+    });
+    for (let tick = 1; tick <= seconds * 60; tick++) {
+      for (const p of players) room.frames(p.id, [{ seq: tick, input: { fire: true, left: tick % 120 < 60, right: tick % 120 >= 60 } }], room.epoch);
       room.tick(STEP);
-      // Keep the sector going so the build stays under steady fire.
+      // Keep the sector going and the pilots alive so the build stays under steady fire.
       room.spawned = 0;
       for (const p of players) { p.hp = 999; p.inv = 5; }
-      if (t % SNAPSHOT_TICKS) continue;
-      for (const e of room.log) if (e.k === 'fx') { const { k, ...fx } = e; effects.push({ id: ++serial, ...fx }); if (effects.length > 160) effects.shift(); }
-      legacy += JSON.stringify(legacySnapshot(room, effects)).length;
-      enemies += room.enemies.length;
-      const { rel, hot } = broadcaster.frame(), message = hot ? (rel ? { ...hot, r: rel } : hot) : rel;
-      if (!message) continue;
-      const bytes = JSON.stringify(message).length;
-      total += bytes; count++; peak = Math.max(peak, bytes);
-      // Like the servers: a message lost with a journal batch in it is replaced by a full sync.
-      if (needSync) { needSync = false; resyncs++; world.sync(broadcaster.sync()); }
-      else if (drop?.(count)) { needSync = !!rel; continue; }
-      else {
-        if (rel && !world.rel(rel)) throw Error('journal gap on an in-order stream');
-        if (hot) world.state(hot);
-      }
-      if (check) worst = Math.max(worst, divergence(room, world));
+      if (tick % SNAPSHOT_TICKS) continue;
+      stats.legacy += legacy.bytes(room); // reads the journal before the publish drains it
+      stats.enemies += room.enemies.length;
+      stats.publishes++;
+      match.publish();
+      if (check && !behind) stats.worst = Math.max(stats.worst, divergence(room, world));
     }
-    return { average: total / count, peak, perSecond: total / count * 60 / SNAPSHOT_TICKS, legacy: legacy / count, enemies: enemies / count, worst, resyncs, bullets: room.bullets.length, shots: room.shots.length };
-  } finally { Math.random = random; }
+    return { average: stats.bytes / stats.messages, peak: stats.peak, legacy: stats.legacy / stats.publishes, enemies: stats.enemies / stats.publishes,
+      worst: stats.worst, recoveries: stats.syncs - 1, bullets: room.bullets.length, shots: room.shots.length };
+  });
 }
 
-// Largest position error between the authority and the client's computed projectiles at the
-// current tick. Missing projectiles count as infinite error; extras must be ones the authority
-// culled for leaving the arena (one tick of slack covers float rounding exactly on the edge).
+// Largest distance between an authority projectile and the client's computed one at the current tick.
+// A missing projectile counts as infinite; an extra one must be leaving the arena, which the authority
+// culls without journaling (one tick of slack covers float rounding exactly on the edge).
 export function divergence(room, world) {
   const tick = room.tickId;
-  let worst = 0;
-  const compare = (list, store, alive) => {
-    const live = new Set();
-    for (const a of list) {
-      live.add(a.id);
-      const b = store.get(a.id);
-      if (!b) return Infinity;
-      const k = (tick - b.t) * STEP;
-      worst = Math.max(worst, Math.hypot(b.x + b.vx * k - a.x, b.y + b.vy * k - a.y));
+  const compare = (authority, store, alive) => {
+    let worst = 0;
+    for (const a of authority) {
+      const p = store.get(a.id);
+      if (!p) return Infinity;
+      const at = projectileAt(p, tick);
+      worst = Math.max(worst, Math.hypot(at.x - a.x, at.y - a.y));
     }
-    for (const b of store.values()) {
-      if (live.has(b.id)) continue;
-      const k = (tick + 1 - b.t) * STEP;
-      if (alive(b.x + b.vx * k, b.y + b.vy * k)) return Infinity;
+    const live = new Set(authority.map(a => a.id));
+    for (const p of store.values()) {
+      if (live.has(p.id)) continue;
+      const at = projectileAt(p, tick + 1);
+      if (alive(at.x, at.y)) return Infinity;
     }
     return worst;
   };
@@ -92,9 +104,10 @@ export function divergence(room, world) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const kb = bytes => (bytes / 1024).toFixed(2).padStart(6) + ' KB';
+  const mbit = bytes => (bytes * 60 / SNAPSHOT_TICKS * 8 / 1e6).toFixed(2).padStart(5) + ' Mbit/s';
   for (const scenario of Object.values(BUILDS)) {
     const r = simulate(scenario, { check: true });
-    const kb = v => (v / 1024).toFixed(2).padStart(6) + ' KB', mbit = v => (v * 60 / SNAPSHOT_TICKS * 8 / 1e6).toFixed(2).padStart(5) + ' Mbit/s';
     console.log(`${scenario.label.padEnd(30)} before ${kb(r.legacy)} ${mbit(r.legacy)} | after ${kb(r.average)} ${mbit(r.average)} peak ${kb(r.peak)} | ${(r.legacy / r.average).toFixed(0).padStart(3)}x smaller | ${r.enemies.toFixed(1)} enemies avg | max error ${r.worst.toFixed(2)} px`);
   }
 }

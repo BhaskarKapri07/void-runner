@@ -41,59 +41,76 @@ function frame(t){const dt=Math.min((t-last)/1000,.035);last=t;update(dt);draw()
 window.addEventListener('keydown',e=>{if(e.target instanceof HTMLElement&&['INPUT','TEXTAREA'].includes(e.target.tagName))return;if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code))e.preventDefault();keys[e.code]=true;if(e.repeat)return;if(e.code==='KeyP'||e.code==='Escape')togglePause();if((mode==='title'||mode==='dead')&&e.code==='Enter')reset();if(mode==='upgrade'&&['Digit1','Digit2','Digit3'].includes(e.code))selectUpgrade(+e.code.slice(-1)-1)});window.addEventListener('keyup',e=>keys[e.code]=false);window.addEventListener('blur',()=>{keys={};if(mode==='play')togglePause()});document.addEventListener('visibilitychange',()=>{if(document.hidden&&mode==='play')togglePause()});$('#start').onclick=reset;$('#pause').onclick=togglePause;$('#sound').onclick=()=>{sound=!sound;$('#sound').textContent=sound?'SOUND ON':'SOUND OFF';if(sound)tone(440,.1)};document.querySelectorAll('[data-key]').forEach(b=>{b.onpointerdown=e=>{e.preventDefault();b.setPointerCapture(e.pointerId);keys[b.dataset.key]=true};b.onpointerup=b.onpointercancel=()=>keys[b.dataset.key]=false});requestAnimationFrame(frame);
 
 </script><script>
-window.VoidShared=(()=>{
+window.VoidNetcode = (() => {
+// Constants and physics shared by the authority (engine.js) and the predicting client (client.js).
+// Anything both sides compute must come from here so the two can't drift apart.
 const STEP = 1 / 60;
+const TICKS_PER_MS = 1 / (STEP * 1000);
 // Authorities publish once every SNAPSHOT_TICKS simulation steps (30 Hz).
 const SNAPSHOT_TICKS = 2;
-const COLORS = ['#c5ff61','#65d9ff','#ff83bd','#ffd16a'];
+// Most input frames one message may carry.
+const MAX_BATCH_FRAMES = 12;
+// How far input may run ahead of the last frame the authority processed.
+const INPUT_WINDOW = 120;
+const COLORS = ['#c5ff61', '#65d9ff', '#ff83bd', '#ffd16a'];
 const BULLET_SPEED = 520;
 const BULLET_SPREAD = .14;
 const SHOT_SPREAD = .19;
+// Volleys leave the ship this far above its centre.
+const MUZZLE_OFFSET = 20;
+
+const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const bulletAlive = (x, y) => y > -30 && x > -30 && x < 990;
 const shotAlive = (x, y) => y < 630 && y > -50 && x > -30 && x < 990;
-// Clients rebuild whole volleys from one journal entry, so both sides must share this math.
-function volleyVelocity(i, n) {
-  const a = (i - (n - 1) / 2) * BULLET_SPREAD;
+
+function volleyVelocity(i, count) {
+  const a = (i - (count - 1) / 2) * BULLET_SPREAD;
   return [Math.sin(a) * BULLET_SPEED, -Math.cos(a) * BULLET_SPEED];
 }
-function shotVelocity(aim, i, n, speed) {
-  const a = aim + (i - (n - 1) / 2) * SHOT_SPREAD;
+
+function shotVelocity(aim, i, count, speed) {
+  const a = aim + (i - (count - 1) / 2) * SHOT_SPREAD;
   return [Math.cos(a) * speed, Math.sin(a) * speed];
 }
+
 function moveShip(p, input, dt = STEP) {
   const x = Number(!!input.right) - Number(!!input.left);
   const y = Number(!!input.down) - Number(!!input.up);
   const n = Math.hypot(x, y) || 1;
-  p.x = Math.max(20, Math.min(940, p.x + x / n * p.speed * dt));
-  p.y = Math.max(30, Math.min(575, p.y + y / n * p.speed * dt));
+  p.x = clamp(p.x + x / n * p.speed * dt, 20, 940);
+  p.y = clamp(p.y + y / n * p.speed * dt, 30, 575);
   return p;
 }
-// One input frame: cool down, move, then report whether this frame fires.
-// The authority and the predicting client both run exactly this per frame.
+
+// One input frame in the order the authority processes it: cool down, move, then fire if ready.
+// Returns true when the frame fires; the caller spawns the volley.
 function stepShip(p, input) {
-  if (typeof p.cool === 'number') p.cool -= STEP;
+  p.cool -= STEP;
   moveShip(p, input);
-  if (!input.fire || !(p.cool <= 0)) return false;
+  if (!input.fire || p.cool > 0) return false;
   p.cool = p.rate;
   return true;
 }
+
 // Collision along relative motion catches projectiles crossing a target between ticks.
 function sweptHit(a, b, radius) {
   const x = (a.px ?? a.x) - (b.px ?? b.x), y = (a.py ?? a.y) - (b.py ?? b.y);
   const vx = a.x - b.x - x, vy = a.y - b.y - y;
-  const t = Math.max(0, Math.min(1, -(x * vx + y * vy) / (vx * vx + vy * vy || 1)));
+  const t = clamp(-(x * vx + y * vy) / (vx * vx + vy * vy || 1), 0, 1);
   return Math.hypot(x + vx * t, y + vy * t) <= radius;
 }
+
+// The authoritative ship with every unacknowledged local frame replayed on top.
 function reconcile(authority, pending) {
   const p = { ...authority };
   if (p.hp > 0) for (const frame of pending) if (frame.seq > (p.ack ?? 0)) stepShip(p, frame.input);
   return p;
 }
 
-return {STEP,SNAPSHOT_TICKS,COLORS,BULLET_SPEED,BULLET_SPREAD,SHOT_SPREAD,bulletAlive,shotAlive,volleyVelocity,shotVelocity,moveShip,stepShip,sweptHit,reconcile};})();
+return {STEP,TICKS_PER_MS,SNAPSHOT_TICKS,MAX_BATCH_FRAMES,INPUT_WINDOW,COLORS,BULLET_SPEED,BULLET_SPREAD,SHOT_SPREAD,MUZZLE_OFFSET,clamp,bulletAlive,shotAlive,volleyVelocity,shotVelocity,moveShip,stepShip,sweptHit,reconcile};})();
 </script>
 <script>
-window.VoidEngine=(()=>{const {STEP, COLORS, moveShip, stepShip, sweptHit, volleyVelocity, shotVelocity}=window.VoidShared;
+window.VoidEngine = (() => {const {STEP, COLORS, MAX_BATCH_FRAMES, INPUT_WINDOW, MUZZLE_OFFSET, moveShip, stepShip, sweptHit, bulletAlive, shotAlive, volleyVelocity, shotVelocity} = window.VoidNetcode;
 
 const randomUUID=()=>globalThis.crypto.randomUUID();
 const randomInt=n=>Math.floor(Math.random()*n);
@@ -106,447 +123,1248 @@ const UPGRADES=[
 {id:'armor',name:'REINFORCED HULL',desc:'+2 maximum hull and repair 2',apply:p=>{p.max=Math.min(15,p.max+2);p.hp=Math.min(p.max,p.hp+2)}},
 {id:'pierce',name:'PHASE ROUNDS',desc:'Pierce one more enemy',apply:p=>p.pierce++},
 {id:'blast',name:'VOLATILE AMMO',desc:'Explosive splash damage',apply:p=>p.blast+=.7}];
-const rand=(a,b)=>a+Math.random()*(b-a),dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y),clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const rand=(a,b)=>a+Math.random()*(b-a),dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
 class Room {
  constructor(code){Object.assign(this,{code,host:null,players:[],phase:'lobby',wave:1,score:0,time:0,enemies:[],bullets:[],shots:[],log:[],logDropped:false,serial:0,spawned:0,spawnTimer:1,clear:0,pause:false,tickId:0,epoch:0});}
- // Change journal drained by the network broadcaster. Unread entries are capped; overflow forces a resync.
+ // Change journal read by the network (protocol.js encodes each kind). Entries:
+ //   fire {slot,x,y,tick,count,id,seq}   a pilot's volley; ids id..id+count-1, seq is the input frame
+ //   volley {x,y,aim,count,speed,tick,id}   an enemy's shot spread
+ //   gone {id}   a projectile removed by a hit (leaving the arena is not journaled; clients cull that)
+ //   clear {bullets,shots}   bulk removal
+ //   burst {x,y,color,count} and hit {x,y,color,count,target,owner,damage}   effects
+ // Undrained entries are capped; overflow marks the journal so every client resyncs.
  record(entry){this.log.push(entry);if(this.log.length>4096){this.log.splice(0,this.log.length-4096);this.logDropped=true}}
- event(x,y,color,n=24,extra={}){this.record({k:'fx',x,y,color,n,...extra})}
+ drain(){const entries=this.log,dropped=this.logDropped;this.log=[];this.logDropped=false;return {entries,dropped}}
+ event(x,y,color,count=24,extra={}){this.record({kind:'burst',x,y,color,count,...extra})}
  add(name){if(this.players.length>=4)throw Error('Room is full (4/4).');if(this.phase!=='lobby')throw Error('This run has started. Join a new room.');const slot=[0,1,2,3].find(i=>!this.players.some(p=>p.slot===i));const p={id:randomUUID(),slot,name:String(name||'Pilot').replace(/[<>]/g,'').slice(0,16),color:COLORS[slot],input:{},lastInput:0,mods:[],offers:[],chosen:false};this.resetPlayer(p);this.players.push(p);this.host??=p.id;return p;}
  resetPlayer(p){Object.assign(p,{x:240+p.slot*160,y:515,hp:5,max:5,speed:280,rate:.2,cool:0,damage:1,spread:1,pierce:0,blast:0,inv:2,revive:0,mods:[],input:{},queue:[],ack:0,lastSeq:0,commands:false,budget:6})}
  remove(id){this.players=this.players.filter(p=>p.id!==id);if(this.host===id)this.host=this.players[0]?.id??null;if(this.phase==='upgrade')this.advanceIfReady();if(this.phase==='play'&&this.players.length&&!this.players.some(p=>p.hp>0))this.phase='dead';}
- start(id){if(id!==this.host||!['lobby','dead'].includes(this.phase))return;this.epoch++;for(const p of this.players)this.resetPlayer(p);Object.assign(this,{phase:'play',wave:1,score:0,time:0,enemies:[],bullets:[],shots:[],spawned:0,spawnTimer:1,clear:0});this.record({k:'clear',bullets:true,shots:true});}
+ start(id){if(id!==this.host||!['lobby','dead'].includes(this.phase))return;this.epoch++;for(const p of this.players)this.resetPlayer(p);Object.assign(this,{phase:'play',wave:1,score:0,time:0,enemies:[],bullets:[],shots:[],spawned:0,spawnTimer:1,clear:0});this.record({kind:'clear',bullets:true,shots:true});}
  input(id,v){const p=this.players.find(p=>p.id===id);if(!p||!v||typeof v!=='object')return;p.input={left:v.left===true,right:v.right===true,up:v.up===true,down:v.down===true,fire:v.fire===true};p.lastInput=Date.now()}
- frames(id,frames,epoch){const p=this.players.find(p=>p.id===id);if(!p||epoch!==this.epoch||this.phase!=='play'||!Array.isArray(frames)||frames.length>12)return;p.commands=true;p.lastInput=Date.now();for(const f of frames){if(!Number.isSafeInteger(f.seq)||f.seq<=p.lastSeq||f.seq>p.lastSeq+120||!f.input||p.queue.length>=120)continue;p.lastSeq=f.seq;p.queue.push({seq:f.seq,input:{left:f.input.left===true,right:f.input.right===true,up:f.input.up===true,down:f.input.down===true,fire:f.input.fire===true}})}}
- fire(p,seq=0){p.cool=p.rate;const id=this.serial+1;for(let i=0;i<p.spread;i++){const [vx,vy]=volleyVelocity(i,p.spread);this.bullets.push({id:++this.serial,owner:p.id,color:p.color,x:p.x,y:p.y-20,vx,vy,damage:p.damage,pierce:p.pierce,blast:p.blast,hit:new Set()})}this.record({k:'fire',slot:p.slot,x:p.x,y:p.y-20,t:this.tickId,n:p.spread,id,seq})}
+ frames(id,frames,epoch){const p=this.players.find(p=>p.id===id);if(!p||epoch!==this.epoch||this.phase!=='play'||!Array.isArray(frames)||frames.length>MAX_BATCH_FRAMES)return;p.commands=true;p.lastInput=Date.now();for(const f of frames){if(!Number.isSafeInteger(f.seq)||f.seq<=p.lastSeq||f.seq>p.lastSeq+INPUT_WINDOW||!f.input||p.queue.length>=INPUT_WINDOW)continue;p.lastSeq=f.seq;p.queue.push({seq:f.seq,input:{left:f.input.left===true,right:f.input.right===true,up:f.input.up===true,down:f.input.down===true,fire:f.input.fire===true}})}}
+ fire(p,seq=0){const id=this.serial+1,y=p.y-MUZZLE_OFFSET;for(let i=0;i<p.spread;i++){const [vx,vy]=volleyVelocity(i,p.spread);this.bullets.push({id:++this.serial,owner:p.id,color:p.color,x:p.x,y,vx,vy,damage:p.damage,pierce:p.pierce,blast:p.blast,hit:new Set()})}this.record({kind:'fire',slot:p.slot,x:p.x,y,tick:this.tickId,count:p.spread,id,seq})}
  choose(id,index){const p=this.players.find(p=>p.id===id);if(this.phase!=='upgrade'||!p||p.chosen||!Number.isInteger(index)||index<0||index>=p.offers.length)return;const u=UPGRADES.find(u=>u.id===p.offers[index]);u.apply(p);p.mods.push(u.name);p.chosen=true;this.advanceIfReady()}
- advanceIfReady(){if(this.players.length&&this.players.every(p=>p.chosen)){this.wave++;this.epoch++;this.phase='play';this.spawned=0;this.spawnTimer=1;this.clear=0;this.shots=[];this.bullets=[];this.record({k:'clear',bullets:true,shots:true});for(const p of this.players){p.offers=[];p.input={};p.inv=2;p.queue=[];p.ack=0;p.lastSeq=0;p.budget=6;}}}
- salvage(){this.phase='upgrade';this.shots=[];this.record({k:'clear',shots:true});for(const p of this.players){if(p.hp<=0)p.hp=Math.min(3,p.max);p.revive=0;p.chosen=false;p.input={};const pool=UPGRADES.filter(u=>u.id!=='spread'||p.spread<9);p.offers=[];while(p.offers.length<3){const i=randomInt(pool.length);p.offers.push(pool.splice(i,1)[0].id)}}}
+ advanceIfReady(){if(this.players.length&&this.players.every(p=>p.chosen)){this.wave++;this.epoch++;this.phase='play';this.spawned=0;this.spawnTimer=1;this.clear=0;this.shots=[];this.bullets=[];this.record({kind:'clear',bullets:true,shots:true});for(const p of this.players){p.offers=[];p.input={};p.inv=2;p.queue=[];p.ack=0;p.lastSeq=0;p.budget=6;}}}
+ salvage(){this.phase='upgrade';this.shots=[];this.record({kind:'clear',shots:true});for(const p of this.players){if(p.hp<=0)p.hp=Math.min(3,p.max);p.revive=0;p.chosen=false;p.input={};const pool=UPGRADES.filter(u=>u.id!=='spread'||p.spread<9);p.offers=[];while(p.offers.length<3){const i=randomInt(pool.length);p.offers.push(pool.splice(i,1)[0].id)}}}
  hurt(p){if(p.hp<=0||p.inv>0)return;p.hp--;p.inv=1.5;this.event(p.x,p.y,p.color,p.hp?15:45)}
  kill(e){if(e.dead)return;e.dead=true;this.score+=e.type==='boss'?1500:e.type==='tank'?150:75;this.event(e.x,e.y,'#ff9b65',e.type==='boss'?70:25)}
  spawn(){const boss=this.wave%5===0,tank=!boss&&Math.random()<.25;const hp=(boss?55+this.wave*12:tank?4+Math.floor(this.wave/2):1+Math.floor(this.wave/3))*(1+(this.players.length-1)*.55);this.enemies.push({id:++this.serial,x:boss?480:rand(40,920),y:-40,hp,max:hp,type:boss?'boss':tank?'tank':'scout',r:boss?58:tank?20:15,age:rand(0,6),speed:boss?35:tank?45+this.wave*3:65+this.wave*5,fire:rand(1,3)});this.spawned++}
  tick(dt){if(this.phase!=='play')return;this.time+=dt;this.tickId++;const live=this.players.filter(p=>p.hp>0);if(!live.length){this.phase='dead';return;}for(const p of this.players){p.inv-=dt;if(p.hp<=0){const near=live.some(a=>dist(p,a)<55);p.revive=near?p.revive+dt:Math.max(0,p.revive-dt);if(p.revive>=3){p.hp=Math.min(3,p.max);p.inv=3;p.revive=0;this.event(p.x,p.y,p.color,35)}continue;}p.px=p.x;p.py=p.y;
- if(p.commands){p.budget=Math.min(6,p.budget+dt/STEP);const count=Math.min(p.queue.length,Math.floor(p.budget),Math.ceil(dt/STEP)+1);for(let i=0;i<count;i++){const f=p.queue.shift();p.ack=f.seq;p.budget--;if(stepShip(p,f.input))this.fire(p,f.seq)}}else{p.cool-=dt;if(Date.now()-p.lastInput>500)p.input={};moveShip(p,p.input,dt);if(p.input.fire&&p.cool<=0)this.fire(p)}}
+ if(p.commands){p.budget=Math.min(6,p.budget+dt/STEP);const count=Math.min(p.queue.length,Math.floor(p.budget),Math.ceil(dt/STEP)+1);for(let i=0;i<count;i++){const f=p.queue.shift();p.ack=f.seq;p.budget--;if(stepShip(p,f.input))this.fire(p,f.seq)}}else{p.cool-=dt;if(Date.now()-p.lastInput>500)p.input={};moveShip(p,p.input,dt);if(p.input.fire&&p.cool<=0){p.cool=p.rate;this.fire(p)}}}
 
  const total=this.wave%5===0?1:8+this.wave*3+(this.players.length-1)*3;this.spawnTimer-=dt;if(this.spawned<total&&this.spawnTimer<=0){this.spawn();this.spawnTimer=Math.max(.25,.95-this.wave*.035)}
  for(const b of this.bullets){b.px=b.x;b.py=b.y;b.x+=b.vx*dt;b.y+=b.vy*dt}
- for(const e of this.enemies){if(e.dead)continue;e.px=e.x;e.py=e.y;e.age+=dt;e.y+=e.speed*dt;if(e.type==='boss'&&e.y>95){e.y=95;e.x=480+Math.sin(e.age*.65)*310}else e.x+=Math.sin(e.age*2)*25*dt;e.fire-=dt;if(e.fire<=0&&e.y>0){const target=live.reduce((a,b)=>dist(e,a)<dist(e,b)?a:b),a=Math.atan2(target.y-e.y,target.x-e.x),count=e.type==='boss'?9:e.type==='tank'?3:1,speed=130+this.wave*5,id=this.serial+1;for(let i=0;i<count;i++){const [vx,vy]=shotVelocity(a,i,count,speed);this.shots.push({id:++this.serial,x:e.x,y:e.y,vx,vy})}this.record({k:'volley',x:e.x,y:e.y,a,n:count,speed,t:this.tickId,id});e.fire=e.type==='boss'?.8:rand(1.8,3.2)}for(const p of live)if(dist(e,p)<e.r+11){this.hurt(p);if(e.type!=='boss')e.dead=true}if(e.y>650)e.dead=true;
- for(const b of this.bullets){if(e.dead||b.dead||b.hit.has(e.id)||!sweptHit(b,e,e.r+5))continue;b.hit.add(e.id);e.hp-=b.damage;this.event(e.x,e.y,b.color,5,{kind:'hit',target:e.id,owner:b.owner,damage:b.damage});if(b.blast){this.event(b.x,b.y,'#ffbf68',6);for(const other of this.enemies)if(other!==e&&!other.dead&&dist(e,other)<65){other.hp-=b.blast;this.event(other.x,other.y,b.color,4,{kind:'hit',target:other.id,owner:b.owner,damage:b.blast});if(other.hp<=0)this.kill(other)}}if(b.pierce--<=0){b.dead=true;this.record({k:'gone',id:b.id})}if(e.hp<=0)this.kill(e)}}
- for(const s of this.shots){s.px=s.x;s.py=s.y;s.x+=s.vx*dt;s.y+=s.vy*dt;for(const p of live)if(!s.dead&&sweptHit(s,p,13)){s.dead=true;this.record({k:'gone',id:s.id});this.hurt(p)}}
- this.bullets=this.bullets.filter(b=>!b.dead&&b.y>-30&&b.x>-30&&b.x<990);this.shots=this.shots.filter(s=>!s.dead&&s.y<630&&s.y>-50&&s.x>-30&&s.x<990);this.enemies=this.enemies.filter(e=>!e.dead);
+ for(const e of this.enemies){if(e.dead)continue;e.px=e.x;e.py=e.y;e.age+=dt;e.y+=e.speed*dt;if(e.type==='boss'&&e.y>95){e.y=95;e.x=480+Math.sin(e.age*.65)*310}else e.x+=Math.sin(e.age*2)*25*dt;e.fire-=dt;if(e.fire<=0&&e.y>0){const target=live.reduce((a,b)=>dist(e,a)<dist(e,b)?a:b),a=Math.atan2(target.y-e.y,target.x-e.x),count=e.type==='boss'?9:e.type==='tank'?3:1,speed=130+this.wave*5,id=this.serial+1;for(let i=0;i<count;i++){const [vx,vy]=shotVelocity(a,i,count,speed);this.shots.push({id:++this.serial,x:e.x,y:e.y,vx,vy})}this.record({kind:'volley',x:e.x,y:e.y,aim:a,count,speed,tick:this.tickId,id});e.fire=e.type==='boss'?.8:rand(1.8,3.2)}for(const p of live)if(dist(e,p)<e.r+11){this.hurt(p);if(e.type!=='boss')e.dead=true}if(e.y>650)e.dead=true;
+ for(const b of this.bullets){if(e.dead||b.dead||b.hit.has(e.id)||!sweptHit(b,e,e.r+5))continue;b.hit.add(e.id);e.hp-=b.damage;this.event(e.x,e.y,b.color,5,{kind:'hit',target:e.id,owner:b.owner,damage:b.damage});if(b.blast){this.event(b.x,b.y,'#ffbf68',6);for(const other of this.enemies)if(other!==e&&!other.dead&&dist(e,other)<65){other.hp-=b.blast;this.event(other.x,other.y,b.color,4,{kind:'hit',target:other.id,owner:b.owner,damage:b.blast});if(other.hp<=0)this.kill(other)}}if(b.pierce--<=0){b.dead=true;this.record({kind:'gone',id:b.id})}if(e.hp<=0)this.kill(e)}}
+ for(const s of this.shots){s.px=s.x;s.py=s.y;s.x+=s.vx*dt;s.y+=s.vy*dt;for(const p of live)if(!s.dead&&sweptHit(s,p,13)){s.dead=true;this.record({kind:'gone',id:s.id});this.hurt(p)}}
+ this.bullets=this.bullets.filter(b=>!b.dead&&bulletAlive(b.x,b.y));this.shots=this.shots.filter(s=>!s.dead&&shotAlive(s.x,s.y));this.enemies=this.enemies.filter(e=>!e.dead);
  if(!this.players.some(p=>p.hp>0)){this.phase='dead';return}if(this.spawned>=total&&!this.enemies.length){this.clear+=dt;if(this.clear>1.1)this.salvage()}}
 }
 
 return {UPGRADES,Room};})();
 </script>
 <script>
-window.VoidProtocol=(()=>{const {STEP, SNAPSHOT_TICKS, COLORS, bulletAlive, shotAlive, volleyVelocity, shotVelocity}=window.VoidShared;
+window.VoidProtocol = (() => {const {COLORS, MAX_BATCH_FRAMES} = window.VoidNetcode;
 
-// Wire format v2. The authority sends two kinds of messages:
-//   rel    reliable, ordered, sent exactly once: projectile spawns and removals, effects, roster changes
-//   state  latest-only: ships, enemies, score. Losing one is harmless.
-// Projectiles fly in straight lines, so clients compute their positions instead of receiving them
-// every snapshot. A client that misses a rel batch asks for a full sync.
+// Wire format, version 2.
+//
+// Authority → client
+//   sync   { type, batch, meta, state, bullets, shots }   full state, on join and on recovery
+//   rel    { type, batch, entries, meta? }                reliable, ordered, each batch sent once
+//   state  { type, tick, epoch, batch, score, time, ships, enemies, rel? }
+//          latest only; losing one is harmless. Over WebSocket the publish's `rel` rides inside it.
+// Client → authority
+//   frames { type, epoch, seq, inputs }   `inputs` holds one bitmask per frame, from `seq` upward
+//   also ping, resync, start, choose, leave, and create/join/hello carrying `v: PROTOCOL`
+//
+// `batch` numbers journal batches: a state's batch is the last one sent before it, and a client
+// that sees a gap asks for a sync. `meta` (roster, phase, upgrades) is only sent when it changes.
+// High-volume records are positional arrays; each has exactly one encoder and one decoder below.
 const PROTOCOL = 2;
-const FIRE = 0, VOLLEY = 1, GONE = 2, CLEAR = 3, BURST = 4, HIT = 5;
-const FX_COLORS = [...COLORS, '#ff9b65', '#ffbf68'];
-const ENEMY_TYPES = ['scout', 'tank', 'boss'];
+
 const INPUT_KEYS = ['left', 'right', 'up', 'down', 'fire'];
-const r1 = v => Math.round(v * 10) / 10, r2 = v => Math.round(v * 100) / 100, r4 = v => Math.round(v * 1e4) / 1e4;
+const ENEMY_TYPES = ['scout', 'tank', 'boss'];
+const ENTRY = { fire: 0, volley: 1, gone: 2, clear: 3, burst: 4, hit: 5 };
+const ENTRY_KINDS = Object.keys(ENTRY);
+// Colors effects use, sent as an index; any other color is sent as its string.
+const EFFECT_COLORS = [...COLORS, '#ff9b65', '#ffbf68'];
+
+const round = (value, places) => Math.round(value * 10 ** places) / 10 ** places;
 const slotOf = color => Math.max(0, COLORS.indexOf(color));
-const colorCode = color => { const i = FX_COLORS.indexOf(color); return i < 0 ? color : i; };
 
-// Input frames travel as one bitmask per frame; sequence numbers are consecutive within a batch.
-function encodeFrames(epoch, frames) {
-  return { type: 'frames', e: epoch, s: frames[0].seq, i: frames.map(f => INPUT_KEYS.reduce((bits, key, n) => f.input[key] ? bits | 1 << n : bits, 0)) };
-}
-function decodeFrames(m) {
-  if (!Number.isSafeInteger(m.s) || !Array.isArray(m.i) || m.i.length > 12) return null;
-  const frames = [];
-  for (let n = 0; n < m.i.length; n++) {
-    const bits = m.i[n];
-    if (!Number.isInteger(bits) || bits < 0 || bits > 31) return null;
-    const input = {};
-    for (let b = 0; b < INPUT_KEYS.length; b++) input[INPUT_KEYS[b]] = (bits >> b & 1) === 1;
-    frames.push({ seq: m.s + n, input });
+// ship: [slot, x, y, hp, inv, revive, ack, cool]. `cool` stays unrounded: at 0.2 s (exactly 12 frames)
+// the authority's cooldown ends a hair above zero, and rounding it moves the predicted shot by a frame.
+const encodeShip = p => [p.slot, round(p.x, 1), round(p.y, 1), p.hp, round(Math.max(0, p.inv), 2), round(p.revive, 2), p.ack, Math.max(0, p.cool)];
+const decodeShip = ([slot, x, y, hp, inv, revive, ack, cool]) => ({ slot, x, y, hp, inv, revive, ack, cool });
+
+// enemy: [id, type, x, y] plus [hp, max] for bosses, the only enemies whose health is drawn.
+const encodeEnemy = e => {
+  const base = [e.id, ENEMY_TYPES.indexOf(e.type), round(e.x, 1), round(e.y, 1)];
+  return e.type === 'boss' ? [...base, round(e.hp, 1), round(e.max, 1)] : base;
+};
+const decodeEnemy = ([id, type, x, y, hp, max]) => ({ id, type: ENEMY_TYPES[type], x, y, hp, max });
+
+// Sync projectiles, at the sync's tick: bullet [id, x, y, vx, vy, slot], shot [id, x, y, vx, vy].
+const encodeBullet = b => [b.id, round(b.x, 1), round(b.y, 1), round(b.vx, 1), round(b.vy, 1), slotOf(b.color)];
+const encodeShot = s => [s.id, round(s.x, 1), round(s.y, 1), round(s.vx, 1), round(s.vy, 1)];
+const decodeBullet = ([id, x, y, vx, vy, slot]) => ({ id, x, y, vx, vy, slot });
+const decodeShot = ([id, x, y, vx, vy]) => ({ id, x, y, vx, vy });
+
+// Journal entries (see Room.record for their meaning):
+//   fire [0, slot, x, y, tick, count, id, seq]      volley [1, x, y, aim, count, speed, tick, id]
+//   gone [2, ...ids]                                clear  [3, 1 bullets | 2 shots]
+//   burst [4, x, y, color, count]                   hit    [5, target, slot, damage]
+function encodeEntry(e) {
+  switch (e.kind) {
+    case 'fire': return [ENTRY.fire, e.slot, round(e.x, 1), round(e.y, 1), e.tick, e.count, e.id, e.seq];
+    case 'volley': return [ENTRY.volley, round(e.x, 1), round(e.y, 1), round(e.aim, 4), e.count, e.speed, e.tick, e.id];
+    case 'gone': return [ENTRY.gone, e.id];
+    case 'clear': return [ENTRY.clear, (e.bullets ? 1 : 0) | (e.shots ? 2 : 0)];
+    case 'burst': { const color = EFFECT_COLORS.indexOf(e.color); return [ENTRY.burst, Math.round(e.x), Math.round(e.y), color < 0 ? e.color : color, e.count]; }
+    // A hit is drawn on its target, so it needs no position of its own.
+    case 'hit': return [ENTRY.hit, e.target, slotOf(e.color), round(e.damage, 1)];
+    default: throw Error('Unknown journal entry: ' + e.kind);
   }
-  return { epoch: m.e, frames };
 }
-
-function encodeMeta(room) {
-  return { code: room.code, host: room.host, phase: room.phase, wave: room.wave, epoch: room.epoch,
-    players: room.players.map(p => ({ id: p.id, slot: p.slot, name: p.name, max: p.max, speed: p.speed, rate: p.rate, damage: p.damage, spread: p.spread, pierce: p.pierce, blast: p.blast, mods: p.mods, offers: p.offers, chosen: p.chosen })) };
-}
-// `q` is the journal batch this state follows. `cool` goes unrounded: at 0.2 s (exactly 12 frames) the
-// authority's cooldown ends a hair above zero, and any rounding moves the predicted shot by a frame.
-function encodeState(room, q) {
-  return { type: 'state', t: room.tickId, e: room.epoch, q, s: room.score, tm: r1(room.time),
-    p: room.players.map(p => [p.slot, r1(p.x), r1(p.y), p.hp, r2(Math.max(0, p.inv)), r2(p.revive), p.ack, Math.max(0, p.cool)]),
-    n: room.enemies.map(e => e.type === 'boss' ? [e.id, 2, r1(e.x), r1(e.y), r1(e.hp), r1(e.max)] : [e.id, e.type === 'tank' ? 1 : 0, r1(e.x), r1(e.y)]) };
+function decodeEntry(e) {
+  switch (ENTRY_KINDS[e[0]]) {
+    case 'fire': { const [, slot, x, y, tick, count, id, seq] = e; return { kind: 'fire', slot, x, y, tick, count, id, seq }; }
+    case 'volley': { const [, x, y, aim, count, speed, tick, id] = e; return { kind: 'volley', x, y, aim, count, speed, tick, id }; }
+    case 'gone': return { kind: 'gone', ids: e.slice(1) };
+    case 'clear': return { kind: 'clear', bullets: (e[1] & 1) !== 0, shots: (e[1] & 2) !== 0 };
+    case 'burst': return { kind: 'burst', x: e[1], y: e[2], color: typeof e[3] === 'number' ? EFFECT_COLORS[e[3]] : e[3], count: e[4] };
+    case 'hit': return { kind: 'hit', target: e[1], slot: e[2], color: COLORS[e[2]], damage: e[3] };
+    default: throw Error('Unknown journal entry: ' + e[0]);
+  }
 }
 function encodeEntries(entries) {
   const out = [];
   for (const e of entries) {
-    if (e.k === 'fire') out.push([FIRE, e.slot, r1(e.x), r1(e.y), e.t, e.n, e.id, e.seq]);
-    else if (e.k === 'volley') out.push([VOLLEY, r1(e.x), r1(e.y), r4(e.a), e.n, e.speed, e.t, e.id]);
-    else if (e.k === 'gone') { const last = out.at(-1); if (last?.[0] === GONE) last.push(e.id); else out.push([GONE, e.id]); }
-    else if (e.k === 'clear') out.push([CLEAR, (e.bullets ? 1 : 0) | (e.shots ? 2 : 0)]);
-    // Hits are drawn on the target, so they need no position of their own.
-    else if (e.k === 'fx') out.push(e.kind === 'hit' ? [HIT, e.target, slotOf(e.color), r1(e.damage)] : [BURST, Math.round(e.x), Math.round(e.y), colorCode(e.color), e.n]);
+    // Consecutive removals share one record.
+    if (e.kind === 'gone' && out.at(-1)?.[0] === ENTRY.gone) out.at(-1).push(e.id);
+    else out.push(encodeEntry(e));
   }
   return out;
 }
 
-// One per room. Every client receives the same bytes, so each message is encoded once per publish.
+const encodeInput = input => INPUT_KEYS.reduce((bits, key, i) => input[key] ? bits | 1 << i : bits, 0);
+const decodeInput = bits => Object.fromEntries(INPUT_KEYS.map((key, i) => [key, (bits >> i & 1) === 1]));
+const validInput = bits => Number.isInteger(bits) && bits >= 0 && bits < 1 << INPUT_KEYS.length;
+
+// Frames in one batch have consecutive sequence numbers, so only the first is sent.
+function encodeFrames(epoch, frames) {
+  return { type: 'frames', epoch, seq: frames[0].seq, inputs: frames.map(f => encodeInput(f.input)) };
+}
+// Returns null for anything malformed; frames come straight from untrusted clients.
+function decodeFrames(m) {
+  if (!Number.isSafeInteger(m.seq) || !Array.isArray(m.inputs) || m.inputs.length > MAX_BATCH_FRAMES || !m.inputs.every(validInput)) return null;
+  return { epoch: m.epoch, frames: m.inputs.map((bits, i) => ({ seq: m.seq + i, input: decodeInput(bits) })) };
+}
+
+function encodeMeta(room) {
+  const players = room.players.map(({ id, slot, name, max, speed, rate, damage, spread, pierce, blast, mods, offers, chosen }) =>
+    ({ id, slot, name, max, speed, rate, damage, spread, pierce, blast, mods, offers, chosen }));
+  return { code: room.code, host: room.host, phase: room.phase, wave: room.wave, epoch: room.epoch, players };
+}
+function encodeState(room, batch) {
+  return { type: 'state', tick: room.tickId, epoch: room.epoch, batch, score: room.score, time: round(room.time, 1),
+    ships: room.players.map(encodeShip), enemies: room.enemies.map(encodeEnemy) };
+}
+
+// Encodes one room for the network. Every client receives the same messages.
 class Broadcaster {
-  constructor(room) { this.room = room; this.q = 0; this.metaKey = ''; this.tick = -1; }
+  constructor(room) { this.room = room; this.batch = 0; this.metaKey = ''; this.tick = -1; }
+  // Once per publish: the journal batch (null if nothing happened), the latest state (null if the
+  // room hasn't changed), and whether journal overflow forces every client to resync.
   frame() {
-    const room = this.room, entries = room.log.splice(0), resync = room.logDropped;
-    room.logDropped = false;
-    const meta = encodeMeta(room), key = JSON.stringify(meta);
+    const { entries, dropped } = this.room.drain(), meta = encodeMeta(this.room), metaKey = JSON.stringify(meta);
     let rel = null;
-    if (entries.length || key !== this.metaKey) {
-      rel = { type: 'rel', q: ++this.q, l: encodeEntries(entries) };
-      if (key !== this.metaKey) { rel.meta = meta; this.metaKey = key; }
+    if (entries.length || metaKey !== this.metaKey) {
+      rel = { type: 'rel', batch: ++this.batch, entries: encodeEntries(entries) };
+      if (metaKey !== this.metaKey) { rel.meta = meta; this.metaKey = metaKey; }
     }
-    const hot = rel || room.tickId !== this.tick ? encodeState(room, this.q) : null;
-    this.tick = room.tickId;
-    return { rel, hot, resync };
+    const state = rel || this.room.tickId !== this.tick ? encodeState(this.room, this.batch) : null;
+    this.tick = this.room.tickId;
+    return { rel, state, resync: dropped };
   }
-  // Full state for a joining or recovering client. Call after frame() in the same publish.
+  // Full state for a joining or recovering client; call it after frame() in the same publish.
   sync() {
     const room = this.room;
-    return { type: 'sync', q: this.q, meta: encodeMeta(room), state: encodeState(room, this.q),
-      b: room.bullets.map(b => [b.id, r1(b.x), r1(b.y), r1(b.vx), r1(b.vy), slotOf(b.color)]),
-      s: room.shots.map(s => [s.id, r1(s.x), r1(s.y), r1(s.vx), r1(s.vy)]) };
+    return { type: 'sync', batch: this.batch, meta: encodeMeta(room), state: encodeState(room, this.batch),
+      bullets: room.bullets.map(encodeBullet), shots: room.shots.map(encodeShot) };
   }
 }
 
-// Client-side mirror of the match. Projectiles are stored as {x, y, vx, vy, t}: their position at
-// the end of tick t plus a per-second velocity.
-class ClientWorld {
-  constructor() { this.me = null; this.reset(); }
-  reset() {
-    Object.assign(this, { synced: false, q: 0, meta: null, latest: null, mark: null, slot: -1, bullets: new Map(), shots: new Map(), enemies: new Map(), fallen: new Map(), predicted: new Map() });
+return {PROTOCOL,decodeShip,decodeEnemy,decodeBullet,decodeShot,decodeEntry,encodeFrames,decodeFrames,Broadcaster};})();
+</script>
+<script>
+window.VoidMatch = (() => {const {STEP, SNAPSHOT_TICKS} = window.VoidNetcode;const {Broadcaster, decodeFrames} = window.VoidProtocol;
+
+
+// Authority-side pieces shared by every host: the Node server and the Durable Object (through
+// server/hub.js) and the browser host (peer.js).
+
+// Seconds of simulation one late timer may catch up; beyond that the match slows instead.
+const MAX_CATCH_UP = .1;
+
+// One room and the clients watching it. A client is any object with
+//   deliver(out, full) → boolean
+// which sends either a full sync (full = true) or this publish's journal batch and state from `out`,
+// and returns false if the journal batch could not be sent. That client gets a sync next publish.
+class Match {
+  constructor(room) {
+    this.room = room;
+    this.broadcaster = new Broadcaster(room);
+    this.clients = new Set();
   }
-  setMe(id) { this.me = id; if (this.meta) this.setMeta(this.meta); }
-  setMeta(meta) { this.meta = meta; this.slot = meta.players.find(p => p.id === this.me)?.slot ?? -1; }
+  add(client) {
+    client.needSync = true;
+    this.clients.add(client);
+  }
+  remove(client) {
+    this.clients.delete(client);
+  }
+  publish() {
+    const out = new Outbox(this.broadcaster);
+    for (const client of this.clients) {
+      if (client.needSync || out.resync) client.needSync = !client.deliver(out, true);
+      else if (!out.empty && !client.deliver(out, false) && out.rel) client.needSync = true;
+    }
+  }
+}
+
+// What one publish sends. Each encoding is built at most once and shared by every client.
+class Outbox {
+  constructor(broadcaster) {
+    Object.assign(this, broadcaster.frame());
+    this.broadcaster = broadcaster;
+    this.cache = new Map();
+  }
+  get empty() { return !this.rel && !this.state; }
+  get sync() { return this.memo('sync', () => this.broadcaster.sync()); }
+  // Over WebSocket the journal batch rides inside the state message.
+  get combined() { return this.state ? (this.rel ? { ...this.state, rel: this.rel } : this.state) : this.rel; }
+  // JSON for 'sync', 'rel', 'state' or 'combined'.
+  json(part) { return this.memo('json:' + part, () => JSON.stringify(this[part])); }
+  memo(key, make) {
+    if (!this.cache.has(key)) this.cache.set(key, make());
+    return this.cache.get(key);
+  }
+}
+
+// Turns wall-clock time into fixed simulation steps and publishes after every SNAPSHOT_TICKS
+// steps, so snapshots stay evenly spaced in ticks even when a late timer runs several steps.
+class Ticker {
+  constructor(step, publish) {
+    this.step = step;
+    this.publish = publish;
+    this.reset();
+  }
+  reset() {
+    this.last = null;
+    this.carry = 0;
+    this.steps = 0;
+  }
+  advance(now) {
+    this.carry += Math.min(MAX_CATCH_UP, (now - (this.last ?? now)) / 1000);
+    this.last = now;
+    while (this.carry >= STEP) {
+      this.carry -= STEP;
+      this.step();
+      if (++this.steps === SNAPSHOT_TICKS) {
+        this.steps = 0;
+        this.publish();
+      }
+    }
+  }
+}
+
+// Pilot commands every authority accepts, whatever the transport. Returns false for other messages.
+function applyCommand(room, player, m) {
+  if (m.type === 'frames') {
+    const batch = decodeFrames(m);
+    if (batch) room.frames(player, batch.frames, batch.epoch);
+  } else if (m.type === 'input') room.input(player, m.input);
+  else if (m.type === 'start') room.start(player);
+  else if (m.type === 'choose') room.choose(player, m.index);
+  else return false;
+  return true;
+}
+
+return {Match,Outbox,Ticker,applyCommand};})();
+</script>
+<script>
+window.VoidWorld = (() => {const {STEP, TICKS_PER_MS, SNAPSHOT_TICKS, COLORS, MUZZLE_OFFSET, clamp, bulletAlive, shotAlive, volleyVelocity, shotVelocity} = window.VoidNetcode;const {decodeShip, decodeEnemy, decodeEntry, decodeBullet, decodeShot} = window.VoidProtocol;
+
+
+// Input frames of slack when matching a predicted volley to the authority's.
+const CLAIM_WINDOW = 3;
+// Ticks behind the newest state at which projectiles are culled: behind every render clock.
+const CULL_LAG = 20;
+// Ticks a removed enemy's last position is kept for hit effects that arrive after it.
+const FALLEN_TICKS = 60;
+// Ticks an enemy may be drawn beyond its newest sample.
+const MAX_EXTRAPOLATION = 30;
+
+// Projectiles fly in straight lines. Each is stored as its position at the end of tick `t` plus a
+// per-second velocity, which gives its position at any tick.
+function projectileAt(p, tick) {
+  const k = (tick - p.t) * STEP;
+  return { x: p.x + p.vx * k, y: p.y + p.vy * k };
+}
+// A projectile spawned at `origin` during tick `origin.tick`; it moves once in that tick, like the engine's.
+const launched = (id, origin, vx, vy) => ({ id, x: origin.x + vx * STEP, y: origin.y + vy * STEP, vx, vy, t: origin.tick });
+
+function cullLeft(store, tick, alive) {
+  for (const [id, p] of store) {
+    if (tick < p.t) continue;
+    const at = projectileAt(p, tick);
+    if (!alive(at.x, at.y)) store.delete(id);
+  }
+}
+
+// The client's mirror of a match, rebuilt from sync, journal batches and states.
+class ClientWorld {
+  constructor() {
+    this.me = null;
+    this.reset();
+  }
+  reset() {
+    Object.assign(this, { synced: false, batch: 0, meta: null, latest: null, slot: -1, mark: null, provisional: 0 });
+    this.bullets = new Map();
+    this.shots = new Map();
+    this.enemies = new Map();
+    this.fallen = new Map();
+    this.predicted = new Map(); // input seq → provisional bullets of a locally predicted volley
+  }
+  setMe(id) {
+    this.me = id;
+    if (this.meta) this.setMeta(this.meta);
+  }
+  setMeta(meta) {
+    this.meta = meta;
+    this.slot = meta.players.find(p => p.id === this.me)?.slot ?? -1;
+  }
+
   sync(m) {
     this.reset();
     this.setMeta(m.meta);
-    this.q = m.q;
+    this.batch = m.batch;
     this.synced = true;
-    const t = m.state.t;
-    for (const [id, x, y, vx, vy, slot] of m.b) this.bullets.set(id, { id, x, y, vx, vy, t, slot });
-    for (const [id, x, y, vx, vy] of m.s) this.shots.set(id, { id, x, y, vx, vy, t });
+    const t = m.state.tick;
+    for (const raw of m.bullets) { const b = decodeBullet(raw); this.bullets.set(b.id, { ...b, t }); }
+    for (const raw of m.shots) { const s = decodeShot(raw); this.shots.set(s.id, { ...s, t }); }
     this.state(m.state);
   }
-  // Returns false when a batch is missing; the caller must request a sync.
-  rel(m, fx) {
+  // Applies a journal batch. Returns false when a batch is missing; the caller must ask for a sync.
+  rel(m, onEffect) {
     if (!this.synced) return true;
-    if (m.q !== this.q + 1) { this.synced = false; return false; }
-    this.q = m.q;
+    if (m.batch !== this.batch + 1) {
+      this.synced = false;
+      return false;
+    }
+    this.batch = m.batch;
     if (m.meta) this.setMeta(m.meta);
-    for (const e of m.l) this.entry(e, fx);
+    for (const raw of m.entries) this.apply(decodeEntry(raw), onEffect);
     this.expire();
     return true;
   }
-  entry(e, fx) {
-    const kind = e[0];
-    if (kind === FIRE) {
-      const [, slot, sx, sy, t, n, id, seq] = e, guess = slot === this.slot ? this.claim(seq, n) : null;
-      for (let i = 0; i < n; i++) {
-        let b = guess?.[i];
-        if (b) b.id = id + i;
-        else { const [vx, vy] = volleyVelocity(i, n); b = { id: id + i, x: sx + vx * STEP, y: sy + vy * STEP, vx, vy, t, slot }; }
-        this.bullets.set(b.id, b);
-      }
-    } else if (kind === VOLLEY) {
-      const [, sx, sy, a, n, speed, t, id] = e;
-      for (let i = 0; i < n; i++) { const [vx, vy] = shotVelocity(a, i, n, speed); this.shots.set(id + i, { id: id + i, x: sx + vx * STEP, y: sy + vy * STEP, vx, vy, t }); }
-    } else if (kind === GONE) {
-      for (let i = 1; i < e.length; i++) if (!this.bullets.delete(e[i])) this.shots.delete(e[i]);
-    } else if (kind === CLEAR) {
-      if (e[1] & 1) { this.bullets.clear(); this.predicted.clear(); }
-      if (e[1] & 2) this.shots.clear();
-    } else if (kind === BURST) fx?.({ kind: 'burst', x: e[1], y: e[2], color: typeof e[3] === 'number' ? FX_COLORS[e[3]] : e[3], n: e[4] });
-    else if (kind === HIT) fx?.({ kind: 'hit', target: e[1], slot: e[2], color: COLORS[e[2]], damage: e[3] });
+  apply(e, onEffect) {
+    if (e.kind === 'fire') this.addVolley(e);
+    else if (e.kind === 'volley') {
+      for (let i = 0; i < e.count; i++) this.shots.set(e.id + i, launched(e.id + i, e, ...shotVelocity(e.aim, i, e.count, e.speed)));
+    } else if (e.kind === 'gone') {
+      for (const id of e.ids) if (!this.bullets.delete(id)) this.shots.delete(id);
+    } else if (e.kind === 'clear') {
+      if (e.bullets) { this.bullets.clear(); this.predicted.clear(); }
+      if (e.shots) this.shots.clear();
+    } else onEffect?.(e);
+  }
+  // An authority volley. If it is ours and was predicted, the predicted bullets are already on
+  // screen, so they keep flying and just take the authority's ids.
+  addVolley(e) {
+    const predicted = e.slot === this.slot ? this.claim(e) : null;
+    for (let i = 0; i < e.count; i++) {
+      const id = e.id + i;
+      this.bullets.set(id, predicted ? { ...predicted[i], id } : { ...launched(id, e, ...volleyVelocity(i, e.count)), slot: e.slot });
+    }
   }
   state(h) {
-    if (!this.synced || (this.latest && h.t < this.latest.t)) return false;
-    const seen = new Set();
-    for (const [id, type, x, y, hp, max] of h.n) {
-      seen.add(id);
-      const e = this.enemies.get(id);
-      if (!e) this.enemies.set(id, { id, type: ENEMY_TYPES[type], x, y, t: h.t, vx: 0, vy: 0, hp, max });
-      else {
-        if (h.t > e.t) { e.vx = (x - e.x) / (h.t - e.t); e.vy = (y - e.y) / (h.t - e.t); e.t = h.t; }
-        Object.assign(e, { x, y, hp, max });
-      }
-    }
-    for (const [id, e] of this.enemies) if (!seen.has(id)) { this.enemies.delete(id); e.gone = h.t; this.fallen.set(id, e); }
-    for (const [id, e] of this.fallen) if (h.t - e.gone > 60) this.fallen.delete(id);
-    // Cull well behind every render clock so memory stays bounded even when nothing is drawn.
-    const cull = h.t - 20;
-    for (const [id, b] of this.bullets) { const k = (cull - b.t) * STEP; if (k >= 0 && !bulletAlive(b.x + b.vx * k, b.y + b.vy * k)) this.bullets.delete(id); }
-    for (const [id, s] of this.shots) { const k = (cull - s.t) * STEP; if (k >= 0 && !shotAlive(s.x + s.vx * k, s.y + s.vy * k)) this.shots.delete(id); }
-    this.latest = h;
-    const mine = h.p.find(p => p[0] === this.slot);
-    if (mine) this.mark = { ack: mine[6], q: h.q };
+    if (!this.synced || (this.latest && h.tick < this.latest.tick)) return false;
+    this.updateEnemies(h);
+    // Culling here keeps memory bounded even when nothing is drawn (hidden tabs).
+    cullLeft(this.bullets, h.tick - CULL_LAG, bulletAlive);
+    cullLeft(this.shots, h.tick - CULL_LAG, shotAlive);
+    this.latest = { tick: h.tick, epoch: h.epoch, batch: h.batch, score: h.score, time: h.time, ships: h.ships.map(decodeShip) };
+    const mine = this.latest.ships.find(s => s.slot === this.slot);
+    if (mine) this.mark = { ack: mine.ack, batch: h.batch };
     this.expire();
     return true;
   }
-  // A predicted volley is wrong once the authority has processed frames past it and every journal
-  // batch up to that state has arrived. Waiting for the journal matters on WebRTC, where state can
-  // overtake a delayed reliable batch. The margin covers claim()'s seq tolerance.
-  expire() {
-    const mark = this.mark;
-    if (!mark || this.q < mark.q) return;
-    for (const [seq, volley] of this.predicted) if (seq + 6 <= mark.ack) this.drop(seq, volley);
+  updateEnemies(h) {
+    const seen = new Set();
+    for (const raw of h.enemies) {
+      const next = decodeEnemy(raw), e = this.enemies.get(next.id);
+      seen.add(next.id);
+      if (!e) { this.enemies.set(next.id, { ...next, t: h.tick, vx: 0, vy: 0 }); continue; }
+      // Velocity from the last two samples lets enemies be drawn ahead of the newest state.
+      if (h.tick > e.t) {
+        e.vx = (next.x - e.x) / (h.tick - e.t);
+        e.vy = (next.y - e.y) / (h.tick - e.t);
+        e.t = h.tick;
+      }
+      Object.assign(e, next);
+    }
+    for (const [id, e] of this.enemies) {
+      if (seen.has(id)) continue;
+      this.enemies.delete(id);
+      e.gone = h.tick;
+      this.fallen.set(id, e);
+    }
+    for (const [id, e] of this.fallen) if (h.tick - e.gone > FALLEN_TICKS) this.fallen.delete(id);
   }
-  // Own volleys appear the moment the local frame fires; the authority's entry later adopts them.
-  predict(seq, sx, sy, n, t) {
-    const volley = [];
-    for (let i = 0; i < n; i++) {
-      const [vx, vy] = volleyVelocity(i, n), b = { id: -(seq * 16 + i + 1), x: sx + vx * STEP, y: sy + vy * STEP, vx, vy, t, slot: this.slot };
+
+  // Shows our volley the moment the local frame fires. `ship` is the predicted ship after that frame.
+  predict(seq, ship, tick) {
+    const origin = { x: ship.x, y: ship.y - MUZZLE_OFFSET, tick }, volley = [];
+    for (let i = 0; i < ship.spread; i++) {
+      const b = { ...launched(--this.provisional, origin, ...volleyVelocity(i, ship.spread)), slot: this.slot };
       this.bullets.set(b.id, b);
       volley.push(b);
     }
     this.predicted.set(seq, volley);
   }
-  claim(seq, n) {
-    let best = null, gap = 4;
-    for (const [s, v] of this.predicted) { const d = Math.abs(s - seq); if (d < gap && v.length === n) { best = s; gap = d; } }
+  // The predicted volley closest in seq to an authority fire entry, removed from the predictions.
+  claim({ seq, count }) {
+    let best = null;
+    for (const [s, volley] of this.predicted) {
+      const gap = Math.abs(s - seq);
+      if (volley.length === count && gap <= CLAIM_WINDOW && (best === null || gap < Math.abs(best - seq))) best = s;
+    }
     if (best === null) return null;
     const volley = this.predicted.get(best);
-    this.drop(best, volley);
+    this.drop(best);
     return volley;
   }
-  drop(seq, volley) { this.predicted.delete(seq); for (const b of volley) this.bullets.delete(b.id); }
-  clearPredictions() { for (const [seq, volley] of this.predicted) this.drop(seq, volley); }
+  // A prediction is wrong once the authority has processed frames beyond the claim window and every
+  // journal batch up to that state has arrived. On WebRTC a state can overtake a delayed batch.
+  expire() {
+    const mark = this.mark;
+    if (!mark || this.batch < mark.batch) return;
+    for (const seq of this.predicted.keys()) if (seq + CLAIM_WINDOW <= mark.ack) this.drop(seq);
+  }
+  drop(seq) {
+    for (const b of this.predicted.get(seq)) this.bullets.delete(b.id);
+    this.predicted.delete(seq);
+  }
+  clearPredictions() {
+    for (const seq of this.predicted.keys()) this.drop(seq);
+  }
+
+  // Draw queries. Our own bullets and enemy shots are drawn on the own clock, other pilots' bullets on
+  // the interpolation clock. A projectile that has left the arena at the tick it is drawn is gone for good.
+  visibleBullets(own, interp) {
+    const out = [];
+    for (const [id, b] of this.bullets) {
+      const tick = b.slot === this.slot ? own : interp;
+      if (tick < b.t) continue; // not fired yet at the time it is drawn
+      const at = projectileAt(b, tick);
+      if (bulletAlive(at.x, at.y)) out.push({ ...at, color: COLORS[b.slot] });
+      else this.bullets.delete(id);
+    }
+    return out;
+  }
+  visibleShots(own) {
+    const out = [];
+    for (const [id, s] of this.shots) {
+      if (own < s.t) continue;
+      const at = projectileAt(s, own);
+      if (shotAlive(at.x, at.y)) out.push(at);
+      else this.shots.delete(id);
+    }
+    return out;
+  }
+  enemiesAt(tick) {
+    return [...this.enemies.values()].map(e => ({ ...e, ...this.enemyAt(e, tick) }));
+  }
   enemyAt(e, tick) {
     if (e.gone !== undefined) return { x: e.x, y: e.y };
-    const k = Math.max(0, Math.min(30, tick - e.t));
+    const k = clamp(tick - e.t, 0, MAX_EXTRAPOLATION);
     return { x: e.x + e.vx * k, y: e.y + e.vy * k };
   }
-  locate(id, tick) { const e = this.enemies.get(id) ?? this.fallen.get(id); return e ? this.enemyAt(e, tick) : null; }
+  // Where an enemy is drawn at `tick`, including one removed moments ago; null if unknown.
+  locate(id, tick) {
+    const e = this.enemies.get(id) ?? this.fallen.get(id);
+    return e ? this.enemyAt(e, tick) : null;
+  }
+  // Roster from meta merged with the newest ships. A pilot whose ship hasn't arrived yet is left out.
   view() {
-    const h = this.latest, m = this.meta, ships = new Map(h.p.map(p => [p[0], p])), players = [];
-    for (const p of m.players) {
-      const s = ships.get(p.slot);
-      if (s) players.push({ ...p, color: COLORS[p.slot], x: s[1], y: s[2], hp: s[3], inv: s[4], revive: s[5], ack: s[6], cool: s[7] });
-    }
-    return { tick: h.t, epoch: h.e, code: m.code, host: m.host, phase: m.phase, wave: m.wave, score: h.s, time: h.tm, players };
+    const { latest, meta } = this, ships = new Map(latest.ships.map(s => [s.slot, s]));
+    const players = meta.players.filter(p => ships.has(p.slot)).map(p => ({ ...p, ...ships.get(p.slot), color: COLORS[p.slot] }));
+    return { tick: latest.tick, epoch: latest.epoch, code: meta.code, host: meta.host, phase: meta.phase, wave: meta.wave, score: latest.score, time: latest.time, players };
   }
 }
 
-// Maps local time (ms) to server ticks. `received` follows the earliest-arrival envelope,
-// the interpolation buffer adapts to measured jitter, and `own` leads by the input pipeline
-// so enemies and projectiles line up with the locally predicted ship.
+// Clock tuning, in ticks.
+const REANCHOR_TICKS = 60;  // a sample this far off means the connection stalled; start over
+const MIN_BUFFER = 3;
+const MAX_BUFFER = 15;
+
+// Maps local time (ms) to server ticks. `received` follows the earliest-arrival envelope of states,
+// the interpolation buffer adapts to measured jitter, and `own` leads by the input pipeline so enemies
+// and projectiles line up with the locally predicted ship. Both render clocks never run backwards.
 class NetClock {
-  constructor() { this.offset = null; this.jitter = 1; this.buffer = SNAPSHOT_TICKS + 3; this.lead = null; this.last = -Infinity; this.floorInterp = -Infinity; this.floorOwn = -Infinity; }
+  constructor(lead = null) {
+    Object.assign(this, { offset: null, jitter: 1, buffer: SNAPSHOT_TICKS + 3, lead, last: -Infinity, floorInterp: -Infinity, floorOwn: -Infinity });
+  }
   // Only advancing ticks are timing samples; repeats (lobby roster updates) say nothing about latency.
   observe(tick, now) {
     if (tick <= this.last) return;
     this.last = tick;
-    const sample = tick - now * .06;
-    if (this.offset === null || Math.abs(sample - this.offset) > 60) { this.offset = sample; this.floorInterp = this.floorOwn = -Infinity; return; }
+    const sample = tick - now * TICKS_PER_MS;
+    if (this.offset === null || Math.abs(sample - this.offset) > REANCHOR_TICKS) {
+      this.offset = sample;
+      this.floorInterp = this.floorOwn = -Infinity;
+      return;
+    }
     const late = Math.max(0, this.offset - sample);
+    // Early samples pull the envelope forward quickly; late ones drag it back slowly.
     this.offset += (sample - this.offset) * (sample > this.offset ? .5 : .01);
     this.jitter += (late - this.jitter) * .05;
-    this.buffer += (Math.min(15, Math.max(3, SNAPSHOT_TICKS + 1 + 2 * this.jitter)) - this.buffer) * .05;
+    this.buffer += (clamp(SNAPSHOT_TICKS + 1 + 2 * this.jitter, MIN_BUFFER, MAX_BUFFER) - this.buffer) * .05;
   }
   // Ticks between the frame being generated now and the newest tick the server has shown us.
-  observeLead(sample) { this.lead = this.lead === null ? sample : this.lead + (sample - this.lead) * .1; }
-  received(now) { return now * .06 + this.offset; }
+  observeLead(sample) {
+    this.lead = this.lead === null ? sample : this.lead + (sample - this.lead) * .1;
+  }
+  received(now) { return now * TICKS_PER_MS + this.offset; }
   interp(now) { return this.floorInterp = Math.max(this.floorInterp, this.received(now) - this.buffer); }
-  own(now, fallback) { return this.floorOwn = Math.max(this.floorOwn, this.received(now) + (this.lead ?? fallback)); }
+  own(now, fallbackLead) { return this.floorOwn = Math.max(this.floorOwn, this.received(now) + (this.lead ?? fallbackLead)); }
 }
 
-return {PROTOCOL,encodeFrames,decodeFrames,Broadcaster,ClientWorld,NetClock};})();
+return {CLAIM_WINDOW,projectileAt,ClientWorld,NetClock};})();
 </script>
 <script>
-window.VoidPeer=(()=>{const {Room}=window.VoidEngine;const {STEP, SNAPSHOT_TICKS}=window.VoidShared;const {PROTOCOL, Broadcaster, decodeFrames}=window.VoidProtocol;
+window.VoidClient = (() => {const {STEP, SNAPSHOT_TICKS, TICKS_PER_MS, MAX_BATCH_FRAMES, INPUT_WINDOW, clamp, stepShip, reconcile} = window.VoidNetcode;const {encodeFrames} = window.VoidProtocol;const {ClientWorld, NetClock} = window.VoidWorld;
 
 
 
-// The signaling service carries only room discovery and SDP/ICE. Gameplay goes over data channels:
-// journal batches and syncs on the reliable `control` channel, latest-only state on `state`.
-class PeerSession {
-  constructor(signal, receive, fail) {
-    Object.assign(this,{signal,receive,fail,peers:new Map(),room:null,broadcaster:null,id:null,host:null,code:null,closed:false,carry:0,steps:0,last:null,ticker:null,keepAt:0,localSync:false});
+const FLUSH_SECONDS = 1 / 30;  // input frames are sent in batches at 30 Hz
+const PING_MS = 1000;
+const RESYNC_MS = 1000;        // at most one resync request per second
+const HISTORY = 40;            // states kept for interpolating other pilots
+
+// The states around `tick`: the last at or before it and the first at or after it.
+function bracket(history, tick) {
+  let before = history[0], after = before;
+  for (const h of history) {
+    if (h.tick <= tick) before = h;
+    after = h;
+    if (h.tick >= tick) break;
   }
+  return [before, after];
+}
+
+// One pilot's side of a match, independent of the page: applies authority messages, predicts the
+// local ship and its volleys, batches input frames, and says what to draw. `send` delivers a message
+// to the authority.
+class MatchClient {
+  constructor(send) {
+    this.send = send;
+    this.world = new ClientWorld();
+    this.clock = new NetClock();
+    Object.assign(this, { me: null, view: null, predicted: null, history: [], rtt: 0, hits: 0, hadSync: false, resyncAt: -Infinity, pingAt: -Infinity, flushCarry: 0 });
+    this.resetInput();
+  }
+  resetInput() {
+    this.pending = []; // frames sent but not yet acknowledged, replayed on every state
+    this.batch = [];   // frames waiting for the next send
+    this.seq = 0;
+    this.stepCarry = 0;
+  }
+  joined(id) {
+    this.me = id;
+    this.world.setMe(id);
+  }
+  get mine() { return this.view?.players.find(p => p.id === this.me) ?? null; }
+
+  // Applies one authority message. Returns true when something the lobby and HUD show has changed.
+  // Hit effects passed to `onEffect` carry `at`, where the target is drawn, and `mine`.
+  receive(m, now, onEffect) {
+    const before = this.signature();
+    if (m.type === 'pong') this.rtt = Math.round(now - m.sent);
+    else if (m.type === 'sync') {
+      this.world.sync(m);
+      this.hadSync = true;
+      this.afterState(now);
+    } else if (m.type === 'rel') this.journal(m, now, onEffect);
+    else if (m.type === 'state' && (!m.rel || this.journal(m.rel, now, onEffect))) {
+      if (this.world.state(m)) this.afterState(now);
+      else if (!this.world.synced) this.requestResync(now);
+    }
+    return this.signature() !== before;
+  }
+  signature() {
+    const v = this.view;
+    return v ? [v.phase, v.epoch, v.host, v.wave, v.players.map(p => p.id + ':' + p.chosen).join()].join('/') : '';
+  }
+  journal(m, now, onEffect) {
+    if (!this.world.synced || !this.world.rel(m, e => onEffect?.(this.effect(e, now)))) {
+      this.requestResync(now);
+      return false;
+    }
+    if (m.meta && this.world.latest) this.view = this.world.view();
+    return true;
+  }
+  effect(e, now) {
+    if (e.kind !== 'hit') return e;
+    this.hits++;
+    // Drawn where the target is drawn, which runs ahead on the own clock.
+    return { ...e, at: this.world.locate(e.target, this.ownTick(now)), mine: e.slot === this.world.slot };
+  }
+  requestResync(now) {
+    if (!this.hadSync || now - this.resyncAt < RESYNC_MS) return;
+    this.resyncAt = now;
+    this.send({ type: 'resync' });
+  }
+  afterState(now) {
+    const previous = this.view, latest = this.world.latest;
+    this.view = this.world.view();
+    if (!previous || previous.epoch !== this.view.epoch) this.startEpoch();
+    this.clock.observe(latest.tick, now);
+    if (this.history.at(-1)?.tick === latest.tick) this.history.pop();
+    this.history.push(latest);
+    if (this.history.length > HISTORY) this.history.shift();
+    const mine = this.mine;
+    if (!mine) return;
+    this.pending = this.pending.filter(f => f.seq > mine.ack);
+    // Frames not yet processed, net of how late this state arrived, is how far the local ship runs ahead.
+    if (this.view.phase === 'play' && mine.hp > 0 && mine.ack > 0 && this.seq >= mine.ack) {
+      this.clock.observeLead(clamp(this.seq - mine.ack - (this.clock.received(now) - latest.tick), 0, INPUT_WINDOW));
+    }
+    this.predicted = reconcile(mine, this.pending);
+  }
+  // Ticking pauses in the lobby, on upgrades and after defeat, and always resumes in a new epoch.
+  // Re-anchor the clock there instead of reading the pause as lag, and restart input numbering as the
+  // authority does. The input pipeline's lead carries over.
+  startEpoch() {
+    this.clock = new NetClock(this.clock.lead);
+    this.resetInput();
+    this.history = [];
+    this.world.clearPredictions();
+  }
+
+  // Called every animation frame; `input` is null while the pilot can't steer (hidden tab).
+  // Returns true when the local ship fired.
+  update(dt, input, now) {
+    let fired = false;
+    if (this.canSteer(input)) fired = this.steer(dt, input, now);
+    else this.stepCarry = 0;
+    this.flushCarry += dt;
+    if (this.flushCarry >= FLUSH_SECONDS) {
+      this.flushCarry = 0;
+      if (this.batch.length) this.send(encodeFrames(this.view.epoch, this.batch.splice(0, MAX_BATCH_FRAMES)));
+    }
+    if (now - this.pingAt >= PING_MS) {
+      this.pingAt = now;
+      this.send({ type: 'ping', sent: now });
+    }
+    return fired;
+  }
+  // On WebRTC a new roster can arrive before the new epoch's state; frames sent in between would be rejected.
+  canSteer(input) {
+    const v = this.view;
+    return !!input && v?.phase === 'play' && this.world.meta?.epoch === v.epoch && this.predicted?.hp > 0 && this.pending.length < INPUT_WINDOW;
+  }
+  // Generates 60 Hz input frames for `dt`, stepping the predicted ship with the authority's own rules
+  // so any volley shown now is the one the authority will fire.
+  steer(dt, input, now) {
+    this.stepCarry += dt;
+    const steps = Math.floor(this.stepCarry / STEP), own = this.ownTick(now);
+    this.stepCarry -= steps * STEP;
+    let fired = false;
+    for (let n = 0; n < steps; n++) {
+      const frame = { seq: ++this.seq, input };
+      this.pending.push(frame);
+      this.batch.push(frame);
+      if (stepShip(this.predicted, input)) {
+        fired = true;
+        this.world.predict(frame.seq, this.predicted, own - (steps - 1 - n));
+      }
+    }
+    return fired;
+  }
+  // Before the first lead sample, assume one round trip plus a snapshot interval.
+  ownTick(now) { return this.clock.own(now, this.rtt * TICKS_PER_MS + SNAPSHOT_TICKS + 1); }
+
+  // What to draw at `now`. Outside play the authority stops ticking, so both clocks hold at its last tick.
+  scene(now) {
+    const live = this.view.phase === 'play', last = this.world.latest.tick;
+    const own = live ? this.ownTick(now) : last, interp = live ? this.clock.interp(now) : last;
+    return { pilots: this.pilots(interp), enemies: this.world.enemiesAt(own), bullets: this.world.visibleBullets(own, interp), shots: this.world.visibleShots(own) };
+  }
+  // Other pilots are interpolated between states; the local pilot is the prediction.
+  pilots(tick) {
+    const [a, b] = bracket(this.history, tick), f = b.tick > a.tick ? clamp((tick - a.tick) / (b.tick - a.tick), 0, 1) : 0;
+    return this.view.players.map(p => {
+      if (p.id === this.me && this.predicted) return this.predicted;
+      const from = a.ships.find(s => s.slot === p.slot);
+      if (!from) return p;
+      const to = b.ships.find(s => s.slot === p.slot) ?? from;
+      return { ...p, x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f, hp: from.hp, inv: from.inv, revive: from.revive };
+    });
+  }
+  diagnostics() {
+    const v = this.view, p = this.predicted;
+    return { phase: v?.phase, players: v?.players.map(({ id, x, y, hp }) => ({ id, x, y, hp })), predicted: p ? { x: p.x, y: p.y } : null, me: this.me, rtt: this.rtt, hits: this.hits,
+      synced: this.world.synced, bullets: this.world.bullets.size, shots: this.world.shots.size, lead: this.clock.lead, buffer: this.clock.buffer };
+  }
+}
+
+return {MatchClient};})();
+</script>
+<script>
+window.VoidPeer = (() => {const {Room} = window.VoidEngine;const {STEP} = window.VoidNetcode;const {PROTOCOL} = window.VoidProtocol;const {Match, Ticker, applyCommand} = window.VoidMatch;
+
+
+
+
+// Direct mode. The signaling server only introduces browsers (room discovery, SDP and ICE); the
+// host's browser runs the match. Journal batches and syncs use each guest's reliable `control`
+// channel, and latest-only state the unordered `state` channel.
+
+const CONNECT_TIMEOUT_MS = 15000;
+const KEEPALIVE_MS = 20000;               // the Durable Object closes signaling sockets idle for 45 s
+const MAX_BUFFERED_BYTES = 131072;        // a channel this backed up skips sends
+const MAX_CHANNEL_MESSAGE = 262144;
+const VERSION_MISMATCH = 'This game client and the host run different versions. Everyone needs the latest voidrunner.html.';
+const NEEDS_RELAY = 'Try server mode; this network may need a TURN relay.';
+
+class PeerSession {
+  // `signal` sends to the signaling server, `receive` hands authority messages to the local client,
+  // `fail` reports a fatal error.
+  constructor(signal, receive, fail) {
+    Object.assign(this, { signal, receive, fail, name: 'Pilot', peers: new Map(), id: null, host: null, code: null, match: null, local: null, ticker: null, timer: null, keepAt: 0, closed: false, signaling: Promise.resolve() });
+  }
+  get isHost() { return this.match !== null; }
+  // True while a reliable channel is open: to the host for a guest, to any guest for the host.
+  linked() {
+    return this.isHost ? [...this.peers.keys()].some(id => this.isOpen(id)) : this.isOpen(this.host);
+  }
+  isOpen(id) { return this.peers.get(id)?.control?.readyState === 'open'; }
+
+  // Signaling messages are handled one at a time; WebRTC negotiation must not interleave.
   message(m) {
-    this.signaling=(this.signaling||Promise.resolve()).then(()=>this.handleMessage(m));
+    this.signaling = this.signaling.then(() => this.handle(m));
     return this.signaling;
   }
-  async handleMessage(m) {
+  async handle(m) {
     try {
-      if(m.type==='peer-ready') {
-        this.id=m.peer;this.host=m.host;this.code=m.code;
-        if(this.id===this.host){this.room=new Room(this.code);this.broadcaster=new Broadcaster(this.room);const p=this.room.add(this.name);this.player=p.id;this.receive({type:'joined',id:p.id,code:this.code,v:PROTOCOL});this.localSync=true;this.publish();this.startTicker(1000/60);}
-        else this.startTicker(1000);
-      }
-      if(m.type==='peer-new')await this.link(m.peer,true);
-      if(m.type==='signal') {
-        const entry=this.peers.get(m.from)||await this.link(m.from,false);
-        if(m.data?.description){await entry.pc.setRemoteDescription(m.data.description);for(const ice of entry.ice.splice(0))await entry.pc.addIceCandidate(ice);if(m.data.description.type==='offer'){await entry.pc.setLocalDescription(await entry.pc.createAnswer());this.signal({type:'signal',to:m.from,data:{description:entry.pc.localDescription}})}}
-        if(m.data?.candidate){if(entry.pc.remoteDescription)await entry.pc.addIceCandidate(m.data.candidate);else entry.ice.push(m.data.candidate)}
-      }
-      // Signaling sockets can drop while data channels stay open; only a closed channel means someone left.
-      if(m.type==='peer-left'&&this.peers.get(m.peer)?.control?.readyState!=='open')this.drop(m.peer);
-      if(m.type==='peer-ended'&&!this.linked())this.fail(m.message);
-    }catch(e){this.fail('Peer connection failed. Try server mode; this network may need a TURN relay.')}
-  }
-  // True while a reliable channel is open: to the host for a guest, to any guest for the host.
-  linked(){return this.room?[...this.peers.values()].some(e=>e.control?.readyState==='open'):this.peers.get(this.host)?.control?.readyState==='open'}
-  async link(id,offer) {
-    const pc=new RTCPeerConnection({iceServers:window.VOIDRUNNER_ICE_SERVERS||[{urls:'stun:stun.l.google.com:19302'}]});
-    const e={pc,ice:[],control:null,state:null,player:null,needSync:false};this.peers.set(id,e);
-    pc.onicecandidate=ev=>{if(ev.candidate)this.signal({type:'signal',to:id,data:{candidate:ev.candidate}})};
-    const deadline=setTimeout(()=>{if(!this.closed&&pc.connectionState!=='connected'){this.fail('Direct connection timed out. Try server mode; this network may need a TURN relay.')}},15000);
-    pc.onconnectionstatechange=()=>{if(pc.connectionState==='connected')clearTimeout(deadline);if(pc.connectionState==='failed'){clearTimeout(deadline);this.lost(id)}};
-    const attach=channel=>{e[channel.label]=channel;channel.onmessage=ev=>{if(ev.data.length>262144)return;try{const m=JSON.parse(ev.data);if(this.room)this.command(e,m);else this.receive(m)}catch{}};
-      // The reliable channel closing is the fastest signal that the other browser left.
-      if(channel.label==='control')channel.onclose=()=>this.lost(id);
-      let opened=false;const ready=()=>{if(opened)return;opened=true;if(!this.room&&channel.label==='control')channel.send(JSON.stringify({type:'hello',name:this.name,v:PROTOCOL}));};channel.onopen=ready;if(channel.readyState==='open')ready();};
-    pc.ondatachannel=ev=>attach(ev.channel);
-    if(offer){attach(pc.createDataChannel('control'));attach(pc.createDataChannel('state',{ordered:false,maxRetransmits:0}));await pc.setLocalDescription(await pc.createOffer());this.signal({type:'signal',to:id,data:{description:pc.localDescription}})}
-    return e;
-  }
-  lost(id){if(this.closed||!this.peers.has(id))return;if(this.room)this.drop(id);else this.fail('Host connection lost. Return to the lobby.')}
-  drop(id){const e=this.peers.get(id);if(!e)return;if(e.player)this.room?.remove(e.player);e.pc.close();this.peers.delete(id)}
-  // Returns false when the channel is closed or backed up.
-  write(channel,message){if(channel?.readyState!=='open'||channel.bufferedAmount>=131072)return false;channel.send(typeof message==='string'?message:JSON.stringify(message));return true}
-  command(e,m) {
-    if(m.type==='hello'&&!e.player){if(m.v!==PROTOCOL){this.write(e.control,{type:'error',message:'This game client and the host run different versions. Everyone needs the latest voidrunner.html.'});return}try{const p=this.room.add(m.name);e.player=p.id;e.needSync=true;this.write(e.control,{type:'joined',id:p.id,code:this.code,v:PROTOCOL});this.publish()}catch(err){this.write(e.control,{type:'error',message:err.message})}return}
-    if(!e.player)return;
-    if(m.type==='frames'){const d=decodeFrames(m);if(d)this.room.frames(e.player,d.frames,d.epoch)}
-    if(m.type==='choose')this.room.choose(e.player,m.index);
-    if(m.type==='resync')e.needSync=true;
-    if(m.type==='ping')this.write(e.control,{type:'pong',sent:m.sent});
-  }
-  send(m) {
-    if(this.room){if(m.type==='frames'){const d=decodeFrames(m);if(d)this.room.frames(this.player,d.frames,d.epoch)}if(m.type==='choose')this.room.choose(this.player,m.index);if(m.type==='start'){this.room.start(this.player);this.signal({type:'peer-started'})}if(m.type==='resync')this.localSync=true;if(m.type==='ping')this.receive({type:'pong',sent:m.sent});}
-    else this.write(this.peers.get(this.host)?.control,m);
-  }
-  // Hidden tabs stop requestAnimationFrame, so a worker timer also drives pulse(): the host's simulation
-  // and everyone's signaling keepalive. Callers share one wall clock, so extra calls cost nothing.
-  startTicker(ms){if(this.ticker||typeof Worker==='undefined')return;try{const url=URL.createObjectURL(new Blob(['setInterval(()=>postMessage(0),'+ms+')'],{type:'text/javascript'}));this.ticker=new Worker(url);this.ticker.onmessage=()=>{URL.revokeObjectURL(url);this.ticker.onmessage=()=>this.pulse();this.pulse()}}catch{this.ticker=null}}
-  // Signaling is otherwise silent once connected, and idle sockets get closed after 45 s.
-  pulse(){const now=performance.now();if(!this.closed&&now-this.keepAt>20000){this.keepAt=now;this.signal({type:'keepalive'})}this.tick()}
-  tick(){if(!this.room||this.closed)return;const now=performance.now();this.carry+=Math.min(.1,(now-(this.last??now))/1000);this.last=now;while(this.carry>=STEP){this.room.tick(STEP);this.carry-=STEP;this.steps++}if(this.steps>=SNAPSHOT_TICKS){this.steps=0;this.publish()}}
-  // Each message is encoded once per publish and shared by every guest.
-  publish(){
-    if(!this.room)return;const {rel,hot,resync}=this.broadcaster.frame();let relText=null,hotText=null,sync=null,syncText=null;
-    for(const e of this.peers.values()){if(!e.player)continue;
-      if(e.needSync||resync){sync??=this.broadcaster.sync();syncText??=JSON.stringify(sync);if(this.write(e.control,syncText))e.needSync=false;continue}
-      if(rel&&!this.write(e.control,relText??=JSON.stringify(rel)))e.needSync=true;
-      // With ticks frozen (lobby, upgrades) the state sent with a roster change is the only one, so it can't be lossy.
-      if(hot)this.write(rel?.meta?e.control:e.state,hotText??=JSON.stringify(hot));
+      if (m.type === 'peer-ready') this.ready(m);
+      else if (m.type === 'peer-new') await this.link(m.peer, true);
+      else if (m.type === 'signal') await this.negotiate(m);
+      // Signaling sockets can drop while data channels stay open; only a closed channel means a pilot left.
+      else if (m.type === 'peer-left' && !this.isOpen(m.peer)) this.drop(m.peer);
+      else if (m.type === 'peer-ended' && !this.linked()) this.fail(m.message);
+    } catch {
+      this.fail('Peer connection failed. ' + NEEDS_RELAY);
     }
-    if(this.localSync||resync){this.localSync=false;this.receive(sync??this.broadcaster.sync())}else{if(rel)this.receive(rel);if(hot)this.receive(hot)}
   }
-  close(){this.closed=true;this.ticker?.terminate();this.ticker=null;for(const e of this.peers.values())e.pc.close();this.peers.clear();this.room=null;}
+  ready(m) {
+    Object.assign(this, { id: m.peer, host: m.host, code: m.code });
+    if (this.id !== this.host) {
+      this.startTimer(1000);
+      return;
+    }
+    this.match = new Match(new Room(this.code));
+    this.local = { player: this.match.room.add(this.name).id, deliver: (out, full) => this.deliverLocal(out, full) };
+    this.match.add(this.local);
+    this.ticker = new Ticker(() => this.match.room.tick(STEP), () => this.match.publish());
+    this.receive({ type: 'joined', id: this.local.player, code: this.code, v: PROTOCOL });
+    this.match.publish();
+    this.startTimer(1000 / 60);
+  }
+
+  // A guest's (or, for a guest, the host's) connection. Its `deliver` makes it a Match client.
+  track(id, pc) {
+    const entry = { pc, ice: [], control: null, state: null, player: null, needSync: false };
+    entry.deliver = (out, full) => this.deliverPeer(entry, out, full);
+    this.peers.set(id, entry);
+    return entry;
+  }
+  async link(id, offer) {
+    const pc = new RTCPeerConnection({ iceServers: window.VOIDRUNNER_ICE_SERVERS || [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const entry = this.track(id, pc);
+    pc.onicecandidate = ev => { if (ev.candidate) this.signal({ type: 'signal', to: id, data: { candidate: ev.candidate } }); };
+    const deadline = setTimeout(() => {
+      if (!this.closed && pc.connectionState !== 'connected') this.fail('Direct connection timed out. ' + NEEDS_RELAY);
+    }, CONNECT_TIMEOUT_MS);
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') clearTimeout(deadline);
+      if (pc.connectionState === 'failed') { clearTimeout(deadline); this.lost(id); }
+    };
+    pc.ondatachannel = ev => this.attach(id, entry, ev.channel);
+    if (offer) {
+      this.attach(id, entry, pc.createDataChannel('control'));
+      this.attach(id, entry, pc.createDataChannel('state', { ordered: false, maxRetransmits: 0 }));
+      await pc.setLocalDescription(await pc.createOffer());
+      this.signal({ type: 'signal', to: id, data: { description: pc.localDescription } });
+    }
+    return entry;
+  }
+  async negotiate(m) {
+    const entry = this.peers.get(m.from) || await this.link(m.from, false), { pc } = entry;
+    if (m.data?.description) {
+      await pc.setRemoteDescription(m.data.description);
+      for (const candidate of entry.ice.splice(0)) await pc.addIceCandidate(candidate);
+      if (m.data.description.type === 'offer') {
+        await pc.setLocalDescription(await pc.createAnswer());
+        this.signal({ type: 'signal', to: m.from, data: { description: pc.localDescription } });
+      }
+    }
+    // Candidates can arrive before the description they belong to.
+    if (m.data?.candidate) {
+      if (pc.remoteDescription) await pc.addIceCandidate(m.data.candidate);
+      else entry.ice.push(m.data.candidate);
+    }
+  }
+  attach(id, entry, channel) {
+    entry[channel.label] = channel;
+    channel.onmessage = ev => {
+      if (ev.data.length > MAX_CHANNEL_MESSAGE) return;
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (this.isHost) this.command(entry, m);
+      else this.receive(m);
+    };
+    if (channel.label !== 'control') return;
+    // The reliable channel closing is the fastest sign that the other browser left.
+    channel.onclose = () => this.lost(id);
+    // A guest introduces itself once the control channel is open, which it may already be.
+    const hello = () => { if (!this.isHost) channel.send(JSON.stringify({ type: 'hello', name: this.name, v: PROTOCOL })); };
+    if (channel.readyState === 'open') hello();
+    else channel.onopen = hello;
+  }
+  lost(id) {
+    if (this.closed || !this.peers.has(id)) return;
+    if (this.isHost) this.drop(id);
+    else this.fail('Host connection lost. Return to the lobby.');
+  }
+  drop(id) {
+    const entry = this.peers.get(id);
+    if (!entry) return;
+    if (entry.player) {
+      this.match?.room.remove(entry.player);
+      this.match?.remove(entry);
+    }
+    entry.pc.close();
+    this.peers.delete(id);
+  }
+
+  // Host: a message from a guest's channel.
+  command(guest, m) {
+    if (m.type === 'hello') this.welcome(guest, m);
+    else if (!guest.player) return;
+    else if (m.type === 'ping') this.write(guest.control, { type: 'pong', sent: m.sent });
+    else if (m.type === 'resync') guest.needSync = true;
+    else applyCommand(this.match.room, guest.player, m);
+  }
+  welcome(guest, m) {
+    if (guest.player) return;
+    if (m.v !== PROTOCOL) { this.write(guest.control, { type: 'error', message: VERSION_MISMATCH }); return; }
+    try {
+      guest.player = this.match.room.add(m.name).id;
+    } catch (err) {
+      this.write(guest.control, { type: 'error', message: err.message });
+      return;
+    }
+    this.write(guest.control, { type: 'joined', id: guest.player, code: this.code, v: PROTOCOL });
+    this.match.add(guest);
+    this.match.publish();
+  }
+  // A message from the local client: handled here on the host, forwarded to the host by a guest.
+  send(m) {
+    if (!this.isHost) { this.write(this.peers.get(this.host)?.control, m); return; }
+    if (m.type === 'ping') this.receive({ type: 'pong', sent: m.sent });
+    else if (m.type === 'resync') this.local.needSync = true;
+    else if (applyCommand(this.match.room, this.local.player, m) && m.type === 'start') this.signal({ type: 'peer-started' });
+  }
+
+  // Match clients. Return false when the journal batch could not be sent, so the Match resyncs.
+  deliverLocal(out, full) {
+    if (full) this.receive(out.sync);
+    else {
+      if (out.rel) this.receive(out.rel);
+      if (out.state) this.receive(out.state);
+    }
+    return true;
+  }
+  deliverPeer(guest, out, full) {
+    if (full) return this.write(guest.control, out.json('sync'));
+    if (out.rel && !this.write(guest.control, out.json('rel'))) return false;
+    // With ticks frozen (lobby, upgrades) the state sent with a roster change is the only one, so it can't be lossy.
+    if (out.state) this.write(out.rel?.meta ? guest.control : guest.state, out.json('state'));
+    return true;
+  }
+  write(channel, message) {
+    if (channel?.readyState !== 'open' || channel.bufferedAmount >= MAX_BUFFERED_BYTES) return false;
+    channel.send(typeof message === 'string' ? message : JSON.stringify(message));
+    return true;
+  }
+
+  // Hidden tabs stop requestAnimationFrame, so a worker timer also calls pulse(): the host's simulation
+  // and everyone's signaling keepalive. The page calls it every animation frame too; the Ticker only
+  // advances by real elapsed time, so extra calls cost nothing.
+  startTimer(ms) {
+    if (this.timer || typeof Worker === 'undefined') return;
+    try {
+      const url = URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${ms})`], { type: 'text/javascript' }));
+      this.timer = new Worker(url);
+      this.timer.onmessage = () => {
+        URL.revokeObjectURL(url);
+        this.timer.onmessage = () => this.pulse();
+        this.pulse();
+      };
+    } catch {
+      this.timer = null;
+    }
+  }
+  pulse(now = performance.now()) {
+    if (this.closed) return;
+    if (now - this.keepAt > KEEPALIVE_MS) {
+      this.keepAt = now;
+      this.signal({ type: 'keepalive' });
+    }
+    this.ticker?.advance(now);
+  }
+  close() {
+    this.closed = true;
+    this.timer?.terminate();
+    this.timer = null;
+    for (const entry of this.peers.values()) entry.pc.close();
+    this.peers.clear();
+    this.match = null;
+  }
 }
 
 return {PeerSession};})();
 </script>
 <script>
-{const {PeerSession}=window.VoidPeer;const {STEP, SNAPSHOT_TICKS, COLORS, stepShip, reconcile, bulletAlive, shotAlive}=window.VoidShared;const {PROTOCOL, ClientWorld, NetClock, encodeFrames}=window.VoidProtocol;
+{const {PeerSession} = window.VoidPeer;const {PROTOCOL} = window.VoidProtocol;const {MatchClient} = window.VoidClient;
 
 
 
 'use strict';
-(()=>{
-let peer=null,predicted=null,pending=[],batch=[],seq=0,stepCarry=0,history=[],rtt=0,pingAt=0,resyncAt=0,uiAt=0,flash=new Map(),damageText=[],muzzle=0,hits=0,hadSync=false,dirty=false;
-let socket=null,me=null,state=null,uiKey='',barHTML='',modsHTML='',inputTime=0,session=0,clock=new NetClock();
-const world=new ClientWorld();
-const overlay=$('#overlay'),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const descriptions={rapid:['RAPID FIRE','20% faster firing'],spread:['SPLIT SHOT','Two more projectiles'],power:['HEAVY ROUNDS','+1 projectile damage'],speed:['ION THRUSTERS','20% faster movement'],repair:['HULL REPAIR','Restore 3 hull'],armor:['REINFORCED HULL','+2 max hull and repair 2'],pierce:['PHASE ROUNDS','Pierce one more enemy'],blast:['VOLATILE AMMO','Explosive splash damage']};
-const bar=document.createElement('div');bar.id='netbar';bar.className='hidden';$('.arena').before(bar);
-function rawSend(value){if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify(value))}
-function send(value){if(peer)peer.send(value);else rawSend(value)}
-function endpoint(){const q=new URLSearchParams(location.search).get('server');return q||window.VOIDRUNNER_SERVER||(!location.hostname.endsWith('github.io')&&location.protocol!=='file:'?location.origin:'')}
-function openOnline(){window.netActive=true;keys={};mode='online';$('#pause').textContent='? HELP';bar.classList.add('hidden');uiKey='';overlay.classList.remove('hidden');overlay.innerHTML='<div class="eyebrow">ONLINE CO-OP / 1–4 PILOTS</div><h2>FORM YOUR SQUAD.</h2><p>One arena. Four ships. Survive together.</p><div class="netform"><label>MATCH HOST<select id="hostmode"><option value="peer">Player browser (direct co-op)</option><option value="server">Dedicated server (fallback)</option></select></label><label>PILOT NAME<input id="pilotname" maxlength="16" value="Pilot" autocomplete="nickname"></label><label>ROOM CODE<input id="roomcode" maxlength="6" placeholder="6-character code" autocapitalize="characters"></label><div class="netrow"><button class="primary" id="createRoom">CREATE ROOM</button><button id="joinRoom">JOIN ROOM</button></div><details id="connection"><summary>Server connection</summary><label>SERVER ADDRESS<input id="serverurl" placeholder="https://your-server.onrender.com" value="'+esc(endpoint())+'"></label></details></div><div class="neterror" id="neterror" role="status"></div><button id="backSolo">BACK TO SOLO</button>';
-if(!endpoint()){$('#connection').open=true;$('#neterror').textContent='A multiplayer server needs to be deployed first. Enter its address here.'}$('#createRoom').onclick=()=>connect('create');$('#joinRoom').onclick=()=>connect('join');$('#backSolo').onclick=()=>location.href=location.pathname;}
-function connect(action){if(action==='join'&&!/^[A-Z2-9]{6}$/.test($('#roomcode').value.toUpperCase())){$('#neterror').textContent='Enter a six-character room code.';return}let url;try{url=new URL($('#serverurl').value.trim());if(!['https:','http:','ws:','wss:'].includes(url.protocol)||url.username||url.password)throw Error();url.protocol=url.protocol==='https:'||url.protocol==='wss:'?'wss:':'ws:';url.pathname='/';url.search='';url.hash='';if(location.protocol==='https:'&&url.protocol!=='wss:')throw Error();}catch{$('#neterror').textContent='Enter a valid HTTPS server address (HTTP works locally).';return}const usePeer=$('#hostmode').value==='peer';if(usePeer&&!window.RTCPeerConnection){$('#neterror').textContent='WebRTC is unavailable. Choose dedicated server mode.';return}const name=$('#pilotname').value;const message={type:usePeer?'peer-'+action:action,name:$('#pilotname').value,code:$('#roomcode').value.toUpperCase(),v:PROTOCOL};const current=++session;socket?.close();peer?.close();peer=null;state=null;me=null;uiKey='';barHTML='';modsHTML='';predicted=null;pending=[];batch=[];seq=0;history=[];stepCarry=0;rtt=0;hits=0;hadSync=false;flash.clear();damageText=[];world.reset();world.setMe(null);clock=new NetClock();if(usePeer){peer=new PeerSession(rawSend,receive,error);peer.name=name;}socket=new WebSocket(url);$('#neterror').textContent='Connecting… A sleeping server may take a minute.';$('#createRoom').disabled=$('#joinRoom').disabled=true;const timeout=setTimeout(()=>{if(current===session&&socket.readyState!==WebSocket.OPEN){socket.close();error('Connection timed out. Check the server address and try again.')}},65000);socket.onopen=()=>{clearTimeout(timeout);rawSend(message)};socket.onerror=()=>{if(current===session)error('Could not connect. Check the server is running and retry.')};socket.onclose=()=>{clearTimeout(timeout);if(current!==session)return;if(peer&&(peer.linked()||(peer.room&&state&&state.phase!=='lobby')))return;keys={};error(state?'Connection lost. This pilot left the run. Return to the lobby to create or join a new run.':'Connection closed. Check the server address and retry.')};socket.onmessage=e=>{if(current!==session)return;let m;try{m=JSON.parse(e.data)}catch{return}if(peer&&(m.type.startsWith('peer-')||m.type==='signal'))peer.message(m);else receive(m)};}
-function receive(m){
- const now=performance.now();
- if(m.type==='joined'){if(m.v!==PROTOCOL){error('This game client and the match host run different versions. Everyone needs the latest voidrunner.html.');return}me=m.id;world.setMe(me);bar.classList.remove('hidden');return}
- if(m.type==='error'){error(m.message);return}
- if(m.type==='pong'){rtt=Math.round(now-m.sent);return}
- if(m.type==='sync'){world.sync(m);hadSync=true;applyState(now);return}
- if(m.type==='rel'){if(applyRel(m,now)&&dirty&&state){state=world.view();refresh(now)}return}
- if(m.type!=='state')return;
- if(m.r&&!applyRel(m.r,now))return;
- if(world.state(m))applyState(now);else if(!world.synced)resync(now);
+// The online page: lobby, HUD, effects and drawing. Match logic lives in MatchClient (shared/client.js).
+// Uses game.js globals: $, ctx, W, H, keys, mode, stars, particles, shake, sprite, tone, burst,
+// random, announce and formatTime.
+(() => {
+const UI_REFRESH_MS = 150;
+const CONNECT_TIMEOUT_MS = 65000;
+const HIT_FLASH_MS = 120;
+const ENEMY_SCALE = { scout: 3, tank: 4, boss: 8 };
+const VERSION_MISMATCH = 'This game client and the match host run different versions. Everyone needs the latest voidrunner.html.';
+const descriptions = { rapid: ['RAPID FIRE', '20% faster firing'], spread: ['SPLIT SHOT', 'Two more projectiles'], power: ['HEAVY ROUNDS', '+1 projectile damage'], speed: ['ION THRUSTERS', '20% faster movement'],
+  repair: ['HULL REPAIR', 'Restore 3 hull'], armor: ['REINFORCED HULL', '+2 max hull and repair 2'], pierce: ['PHASE ROUNDS', 'Pierce one more enemy'], blast: ['VOLATILE AMMO', 'Explosive splash damage'] };
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const overlay = $('#overlay');
+const bar = document.createElement('div');
+bar.id = 'netbar';
+bar.className = 'hidden';
+$('.arena').before(bar);
+
+// One connection at a time. `session` invalidates handlers of sockets from earlier connections.
+let socket = null, peer = null, client = null, session = 0;
+// Page state: what was last rendered, and effects in flight.
+let uiAt = 0, uiKey = '', barHTML = '', modsHTML = '', flash = new Map(), damageText = [], muzzle = 0;
+
+function rawSend(message) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
-// A missing journal batch means projectiles may be wrong; ask the authority for a full sync.
-function resync(now){if(!hadSync||now-resyncAt<1000)return;resyncAt=now;send({type:'resync'})}
-// Roster changes render once the matching state is applied too; a standalone batch renders on its own.
-function applyRel(m,now){if(!world.synced||!world.rel(m,ev=>effect(ev,now))){resync(now);return false}if(m.meta)dirty=true;return true}
-function refresh(now){dirty=false;uiAt=now;renderUI()}
-const lead=()=>rtt*.06+SNAPSHOT_TICKS+1;
-function effect(ev,now){
- if(ev.kind==='hit')hits++;
- // Only the frame loop retires particles, and hidden tabs stop it; skip effects nobody can see.
- if(document.hidden)return;
- if(ev.kind==='burst'){burst(ev.x,ev.y,ev.color,ev.n);return}
- flash.set(ev.target,{until:now+120,color:ev.color});if(ev.slot===world.slot)tone(1200,.025,'triangle',.012);
- // Hits are drawn where the target is drawn, which already runs ahead on the local clock.
- const at=world.locate(ev.target,clock.own(now,lead()));if(!at)return;
- damageText.push({x:at.x,y:at.y,damage:Math.round(ev.damage*10)/10,color:ev.color,life:.5});for(let i=0;i<6;i++)particles.push({x:at.x,y:at.y,vx:random(-80,80),vy:random(-90,20),life:.2,color:ev.color,size:3});
+function send(message) {
+  if (peer) peer.send(message);
+  else rawSend(message);
 }
-function applyState(now){
- const h=world.latest,previous=state;state=world.view();
- const changed=!previous||previous.epoch!==state.epoch;
- // Ticking pauses in the lobby, upgrades and defeat, and always resumes in a new epoch. Re-anchor the
- // clock there instead of reading the pause as lag; the input pipeline's lead carries over.
- if(changed){const lead=clock.lead;clock=new NetClock();clock.lead=lead;pending=[];batch=[];seq=0;stepCarry=0;history=[];world.clearPredictions()}
- clock.observe(h.t,now);
- const mine=state.players.find(p=>p.id===me);
- if(mine){pending=pending.filter(f=>f.seq>mine.ack);
-  // Unprocessed local frames, net of how late this snapshot arrived, is how far the local ship runs ahead of the server.
-  if(state.phase==='play'&&mine.hp>0&&mine.ack>0&&seq>=mine.ack)clock.observeLead(Math.max(0,Math.min(120,seq-mine.ack-(clock.received(now)-h.t))));
-  predicted=reconcile(mine,pending)}
- if(history.at(-1)?.t===h.t)history.pop();history.push({t:h.t,p:h.p});if(history.length>40)history.shift();
- if(dirty||changed||now-uiAt>150||state.phase!==previous?.phase||state.players.length!==previous?.players.length)refresh(now);
+function endpoint() {
+  const fromQuery = new URLSearchParams(location.search).get('server');
+  return fromQuery || window.VOIDRUNNER_SERVER || (!location.hostname.endsWith('github.io') && location.protocol !== 'file:' ? location.origin : '');
+}
+// The server address as a WebSocket URL, or null if this page can't use it.
+function socketUrl(address) {
+  let url;
+  try { url = new URL(address.trim()); } catch { return null; }
+  if (!['https:', 'http:', 'ws:', 'wss:'].includes(url.protocol) || url.username || url.password) return null;
+  url.protocol = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:';
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+  return location.protocol === 'https:' && url.protocol !== 'wss:' ? null : url;
+}
+function formStatus(message) { $('#neterror').textContent = message; }
+
+function openOnline() {
+  window.netActive = true;
+  keys = {};
+  mode = 'online';
+  $('#pause').textContent = '? HELP';
+  bar.classList.add('hidden');
+  uiKey = '';
+  overlay.classList.remove('hidden');
+  overlay.innerHTML = '<div class="eyebrow">ONLINE CO-OP / 1–4 PILOTS</div><h2>FORM YOUR SQUAD.</h2><p>One arena. Four ships. Survive together.</p>'
+    + '<div class="netform"><label>MATCH HOST<select id="hostmode"><option value="peer">Player browser (direct co-op)</option><option value="server">Dedicated server (fallback)</option></select></label>'
+    + '<label>PILOT NAME<input id="pilotname" maxlength="16" value="Pilot" autocomplete="nickname"></label>'
+    + '<label>ROOM CODE<input id="roomcode" maxlength="6" placeholder="6-character code" autocapitalize="characters"></label>'
+    + '<div class="netrow"><button class="primary" id="createRoom">CREATE ROOM</button><button id="joinRoom">JOIN ROOM</button></div>'
+    + '<details id="connection"><summary>Server connection</summary><label>SERVER ADDRESS<input id="serverurl" placeholder="https://your-server.onrender.com" value="' + esc(endpoint()) + '"></label></details></div>'
+    + '<div class="neterror" id="neterror" role="status"></div><button id="backSolo">BACK TO SOLO</button>';
+  if (!endpoint()) {
+    $('#connection').open = true;
+    formStatus('A multiplayer server needs to be deployed first. Enter its address here.');
+  }
+  $('#createRoom').onclick = () => connect('create');
+  $('#joinRoom').onclick = () => connect('join');
+  $('#backSolo').onclick = () => location.href = location.pathname;
 }
 
-function error(message){if(!state){const el=$('#neterror');if(el)el.textContent=message;const c=$('#createRoom'),j=$('#joinRoom');if(c)c.disabled=false;if(j)j.disabled=false;return}overlay.classList.remove('hidden');overlay.innerHTML='<div class="eyebrow">CONNECTION INTERRUPTED</div><h2>SIGNAL LOST.</h2><p class="online-note">'+esc(message)+'</p><button id="netReturn">RETURN TO LOBBY</button>';$('#netReturn').onclick=leave;}
-function leave(){session++;rawSend({type:'leave'});peer?.close();peer=null;socket?.close();socket=null;state=null;me=null;predicted=null;pending=[];batch=[];world.reset();keys={};particles=[];openOnline()}
-function renderUI(){if(!state||!me)return;const p=state.players.find(p=>p.id===me);if(!p)return;const html='<span>ROOM <b>'+esc(state.code)+'</b> · '+(peer?'DIRECT':'SERVER')+' · '+rtt+' ms</span><div class="roster">'+state.players.map(a=>'<span style="color:'+a.color+'">'+esc(a.name)+(a.id===me?' (YOU)':'')+' '+(a.hp>0?a.hp+'/'+a.max:'DOWN')+'</span>').join('')+'</div><button id="leaveRoom">LEAVE ROOM</button>';if(html!==barHTML){barHTML=html;bar.innerHTML=html;$('#leaveRoom').onclick=leave}
-$('#wave').textContent=String(state.wave).padStart(2,'0');$('#hull').textContent=p.hp+' / '+p.max;$('#hull').style.color=p.color;$('#score').textContent=String(state.score).padStart(6,'0');$('#time').textContent=formatTime(state.time);$('#status').textContent=p.hp<=0?'DOWNED / TEAMMATE NEEDED':'SQUAD ONLINE';$('#build').textContent=state.players.length+' PILOTS';$('#modcount').textContent=p.mods.length+' INSTALLED';const mods=p.mods.map(n=>'<span class="mod">'+esc(n)+'</span>').join('')||'<span class="emptymod">Survive a sector to choose your upgrade</span>';if(mods!==modsHTML){modsHTML=mods;$('#mods').innerHTML=mods}
-const key=[state.phase,state.host,state.players.map(a=>a.id+':'+a.chosen).join(','),p.chosen,state.wave].join('/');if(key===uiKey)return;uiKey=key;
-if(state.phase==='play'){overlay.classList.add('hidden');return}overlay.classList.remove('hidden');
-if(state.phase==='lobby'){overlay.innerHTML='<div class="eyebrow">SQUAD ASSEMBLING / '+state.players.length+' OF 4</div><h2>ROOM '+esc(state.code)+'</h2><p>Share this code and the server address with your squad.</p><div class="squad">'+state.players.map(a=>'<div class="pilotcard" style="border-color:'+a.color+'"><b style="color:'+a.color+'">'+esc(a.name)+'</b>'+(a.id===me?'YOU · ':'')+(a.id===state.host?'HOST':'READY')+'</div>').join('')+'</div>'+(state.host===me?'<button class="primary" id="startSquad">LAUNCH SQUAD</button>':'<p>Waiting for the host to launch.</p>')+'<p style="margin-top:20px">Stay near a downed teammate for 3 seconds to revive.'+(peer?' Host: keep this tab visible.':'')+'</p>';if($('#startSquad'))$('#startSquad').onclick=()=>send({type:'start'})}
-if(state.phase==='upgrade'){overlay.innerHTML='<div class="eyebrow">SECTOR CLEARED</div><h2>UPGRADE YOUR SHIP.</h2>'+(p.chosen?'<p>Upgrade installed. Waiting for your squad.</p>':'<p>Choose one. The next sector starts when everyone is ready.</p><div class="choices">'+p.offers.map((id,i)=>'<button class="choice" data-netchoice="'+i+'"><small>0'+(i+1)+'</small><b>'+descriptions[id][0]+'</b><span>'+descriptions[id][1]+'</span></button>').join('')+'</div>');document.querySelectorAll('[data-netchoice]').forEach(b=>b.onclick=()=>send({type:'choose',index:+b.dataset.netchoice}))}
-if(state.phase==='dead'){overlay.innerHTML='<div class="eyebrow">SQUAD LOST</div><h2>THE VOID TAKES EVERYONE.</h2><p>Sector '+state.wave+' · '+state.score+' points · '+formatTime(state.time)+'</p>'+(state.host===me?'<button id="restartSquad" class="primary">RUN IT BACK</button>':'<p>Waiting for the host to restart.</p>');if($('#restartSquad'))$('#restartSquad').onclick=()=>send({type:'start'})}}
-window.netHelp=()=>{if(state?.phase==='play')announce('ARROWS + SPACE / STAY NEAR DOWNED PILOTS TO REVIVE / ONLINE DOES NOT PAUSE')};
-window.netUpdate=dt=>{
- for(const s of stars)s.y=(s.y+s.z*25*dt)%H;
- for(const p of particles){p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt}particles=particles.filter(p=>p.life>0);shake=Math.max(0,shake-dt*30);
- damageText=damageText.filter(d=>(d.life-=dt)>0);for(const d of damageText)d.y-=35*dt;muzzle=Math.max(0,muzzle-dt);
- const now=performance.now();for(const [id,f] of flash)if(f.until<now)flash.delete(id);
- // On WebRTC a new roster can arrive before the new epoch's state; frames sent in between would be rejected.
- if(state?.phase==='play'&&world.meta?.epoch===state.epoch&&predicted?.hp>0&&pending.length<120&&!document.hidden){stepCarry+=dt;const steps=Math.floor(stepCarry/STEP),own=steps?clock.own(now,lead()):0;stepCarry-=steps*STEP;
-  for(let n=0;n<steps;n++){const input={left:!!keys.ArrowLeft,right:!!keys.ArrowRight,up:!!keys.ArrowUp,down:!!keys.ArrowDown,fire:!!keys.Space};const frame={seq:++seq,input};pending.push(frame);batch.push(frame);
-   // Same per-frame cooldown as the authority, so the volley shown now is the one the server will fire.
-   if(stepShip(predicted,input)){muzzle=.06;tone(780,.04);world.predict(seq,predicted.x,predicted.y-20,predicted.spread,own-(steps-1-n))}}}else stepCarry=0;
- inputTime+=dt;if(inputTime>=1/30){inputTime=0;if(batch.length&&state)send(encodeFrames(state.epoch,batch.splice(0,12)))}
- peer?.pulse();
- if(now-pingAt>1000){pingAt=now;send({type:'ping',sent:now})}
-};
-// Remote pilots are interpolated between snapshots; the local pilot is the prediction.
-function pilots(tick){
- if(!history.length)return state.players;let a=history[0],b=a;for(const h of history){if(h.t<=tick)a=h;if(h.t>=tick){b=h;break}b=h}const f=b.t>a.t?Math.max(0,Math.min(1,(tick-a.t)/(b.t-a.t))):0;
- return state.players.map(p=>{if(p.id===me&&predicted)return predicted;const sa=a.p.find(s=>s[0]===p.slot);if(!sa)return p;const sb=b.p.find(s=>s[0]===p.slot)??sa;return {...p,x:sa[1]+(sb[1]-sa[1])*f,y:sa[2]+(sb[2]-sa[2])*f,hp:sa[3],inv:sa[4],revive:sa[5]}});
+function resetSession() {
+  socket?.close();
+  peer?.close();
+  socket = peer = client = null;
+  uiKey = barHTML = modsHTML = '';
+  flash.clear();
+  damageText = [];
 }
-// Enemies and shots are drawn on the local clock (own); other pilots and their bullets on the interpolation clock.
-// Outside play the authority stops ticking, so both clocks hold at its last tick.
-window.netDraw=()=>{ctx.fillStyle='#080c18';ctx.fillRect(0,0,W,H);ctx.save();if(shake)ctx.translate(random(-shake,shake),random(-shake,shake));for(const s of stars){ctx.fillStyle=s.z>1.1?'#7e93ad':'#293b55';ctx.fillRect(s.x|0,s.y|0,2,2)}if(state&&world.latest){const now=performance.now(),live=state.phase==='play',own=live?clock.own(now,lead()):world.latest.t,interp=live?clock.interp(now):world.latest.t;for(const p of pilots(interp)){if(p.hp<=0){ctx.strokeStyle=p.color;ctx.strokeRect(p.x-17,p.y-17,34,34);ctx.fillStyle=p.color;ctx.fillRect(p.x-20,p.y+25,40*p.revive/3,4);ctx.font='12px monospace';ctx.textAlign='center';ctx.fillText('REVIVE',p.x,p.y-26);continue}if(p.inv<=0||Math.floor(p.inv*12)%2===0){ctx.fillStyle='#ffb35f';ctx.fillRect(p.x-5,p.y+15,8,random(8,18));sprite('ship',p.x,p.y,3,[p.color,'#e8f4ff'])}ctx.fillStyle=p.color;ctx.textAlign='center';ctx.font='bold 12px monospace';ctx.fillText(p.name+(p.id===me?' · YOU':''),p.x,p.y+40);if(p.id===me){ctx.strokeStyle=p.color;ctx.strokeRect(p.x-20,p.y-21,40,47)}}for(const e of world.enemies.values()){const at=world.enemyAt(e,own);sprite(e.type,at.x,at.y,e.type==='boss'?8:e.type==='tank'?4:3,flash.get(e.id)?.until>now?['#ffffff',flash.get(e.id).color]:e.type==='boss'?['#986148','#ffc16f']:['#9e405a','#ff8790']);if(e.type==='boss'){ctx.fillStyle='#402c32';ctx.fillRect(260,18,440,7);ctx.fillStyle='#ff9272';ctx.fillRect(260,18,440*e.hp/e.max,7)}}for(const b of world.bullets.values()){const k=((b.slot===world.slot?own:interp)-b.t)*STEP;if(k<0)continue;const x=b.x+b.vx*k,y=b.y+b.vy*k;if(!bulletAlive(x,y)){world.bullets.delete(b.id);continue}ctx.fillStyle=COLORS[b.slot];ctx.fillRect(x-2,y-8,4,13)}ctx.fillStyle='#ff799a';for(const s of world.shots.values()){const k=(own-s.t)*STEP;if(k<0)continue;const x=s.x+s.vx*k,y=s.y+s.vy*k;if(!shotAlive(x,y)){world.shots.delete(s.id);continue}ctx.fillRect(x-3,y-3,6,6)}}for(const p of particles){ctx.globalAlpha=Math.min(1,p.life*3);ctx.fillStyle=p.color;ctx.fillRect(p.x|0,p.y|0,p.size|0,p.size|0)}ctx.globalAlpha=1;ctx.font='bold 14px monospace';ctx.textAlign='center';for(const d of damageText){ctx.fillStyle=d.color;ctx.fillText('-'+d.damage,d.x,d.y)}if(muzzle>0&&predicted){ctx.fillStyle=predicted.color;ctx.fillRect(predicted.x-5,predicted.y-30,10,10)}ctx.restore();};
-window.addEventListener('keydown',e=>{if(!window.netActive||e.repeat||['INPUT','TEXTAREA'].includes(e.target.tagName))return;if(['Digit1','Digit2','Digit3'].includes(e.code)&&state?.phase==='upgrade')send({type:'choose',index:+e.code.slice(-1)-1})});window.addEventListener('blur',()=>{keys={};send({type:'input',input:{}})});document.addEventListener('visibilitychange',()=>{if(document.hidden){keys={};send({type:'input',input:{}})}});window.netDiagnostics=()=>({transport:peer?'peer':'server',phase:state?.phase,players:state?.players.map(p=>({id:p.id,x:p.x,y:p.y,hp:p.hp})),predicted:predicted?{x:predicted.x,y:predicted.y}:null,me,rtt,hits,synced:world.synced,bullets:world.bullets.size,shots:world.shots.size,lead:clock.lead,buffer:clock.buffer});$('#online').onclick=openOnline;
+function connect(action) {
+  const code = $('#roomcode').value.toUpperCase(), name = $('#pilotname').value, usePeer = $('#hostmode').value === 'peer';
+  if (action === 'join' && !/^[A-Z2-9]{6}$/.test(code)) { formStatus('Enter a six-character room code.'); return; }
+  const url = socketUrl($('#serverurl').value);
+  if (!url) { formStatus('Enter a valid HTTPS server address (HTTP works locally).'); return; }
+  if (usePeer && !window.RTCPeerConnection) { formStatus('WebRTC is unavailable. Choose dedicated server mode.'); return; }
+  const current = ++session;
+  resetSession();
+  client = new MatchClient(send);
+  if (usePeer) {
+    peer = new PeerSession(rawSend, receive, error);
+    peer.name = name;
+  }
+  const ws = socket = new WebSocket(url);
+  formStatus('Connecting… A sleeping server may take a minute.');
+  $('#createRoom').disabled = $('#joinRoom').disabled = true;
+  const timeout = setTimeout(() => {
+    if (current === session && ws.readyState !== WebSocket.OPEN) { ws.close(); error('Connection timed out. Check the server address and try again.'); }
+  }, CONNECT_TIMEOUT_MS);
+  ws.onopen = () => {
+    clearTimeout(timeout);
+    rawSend({ type: usePeer ? 'peer-' + action : action, name, code, v: PROTOCOL });
+  };
+  ws.onerror = () => { if (current === session) error('Could not connect. Check the server is running and retry.'); };
+  ws.onclose = () => {
+    clearTimeout(timeout);
+    if (current !== session) return;
+    // A direct match outlives its signaling socket once a data channel is up.
+    if (peer && (peer.linked() || (peer.isHost && client.view && client.view.phase !== 'lobby'))) return;
+    keys = {};
+    error(client.view ? 'Connection lost. This pilot left the run. Return to the lobby to create or join a new run.' : 'Connection closed. Check the server address and retry.');
+  };
+  ws.onmessage = e => {
+    if (current !== session) return;
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (peer && (m.type.startsWith('peer-') || m.type === 'signal')) peer.message(m);
+    else receive(m);
+  };
+}
+function receive(m) {
+  if (!client) return;
+  if (m.type === 'joined') {
+    if (m.v !== PROTOCOL) { error(VERSION_MISMATCH); return; }
+    client.joined(m.id);
+    bar.classList.remove('hidden');
+    return;
+  }
+  if (m.type === 'error') { error(m.message); return; }
+  const now = performance.now();
+  if (client.receive(m, now, showEffect) || now - uiAt > UI_REFRESH_MS) {
+    uiAt = now;
+    renderUI();
+  }
+}
+function error(message) {
+  if (!client?.view) {
+    const status = $('#neterror'), create = $('#createRoom'), join = $('#joinRoom');
+    if (status) status.textContent = message;
+    if (create) create.disabled = false;
+    if (join) join.disabled = false;
+    return;
+  }
+  overlay.classList.remove('hidden');
+  overlay.innerHTML = '<div class="eyebrow">CONNECTION INTERRUPTED</div><h2>SIGNAL LOST.</h2><p class="online-note">' + esc(message) + '</p><button id="netReturn">RETURN TO LOBBY</button>';
+  $('#netReturn').onclick = leave;
+}
+function leave() {
+  session++;
+  rawSend({ type: 'leave' });
+  resetSession();
+  keys = {};
+  particles = [];
+  openOnline();
+}
+
+function renderUI() {
+  const state = client?.view, me = client?.me, pilot = client?.mine;
+  if (!state || !me || !pilot) return;
+  renderBar(state, me);
+  renderHud(state, pilot);
+  // The overlay is rebuilt only when what it shows changes, so its buttons stay clickable.
+  const key = [state.phase, state.host, state.players.map(a => a.id + ':' + a.chosen).join(','), pilot.chosen, state.wave].join('/');
+  if (key === uiKey) return;
+  uiKey = key;
+  if (state.phase === 'play') { overlay.classList.add('hidden'); return; }
+  overlay.classList.remove('hidden');
+  if (state.phase === 'lobby') renderLobby(state, me);
+  if (state.phase === 'upgrade') renderUpgrade(pilot);
+  if (state.phase === 'dead') renderDefeat(state, me);
+}
+function renderBar(state, me) {
+  const roster = state.players.map(a => '<span style="color:' + a.color + '">' + esc(a.name) + (a.id === me ? ' (YOU)' : '') + ' ' + (a.hp > 0 ? a.hp + '/' + a.max : 'DOWN') + '</span>').join('');
+  const html = '<span>ROOM <b>' + esc(state.code) + '</b> · ' + (peer ? 'DIRECT' : 'SERVER') + ' · ' + client.rtt + ' ms</span><div class="roster">' + roster + '</div><button id="leaveRoom">LEAVE ROOM</button>';
+  // Rewriting the bar recreates its button; skip it when nothing changed so clicks aren't lost.
+  if (html === barHTML) return;
+  barHTML = html;
+  bar.innerHTML = html;
+  $('#leaveRoom').onclick = leave;
+}
+function renderHud(state, pilot) {
+  $('#wave').textContent = String(state.wave).padStart(2, '0');
+  $('#hull').textContent = pilot.hp + ' / ' + pilot.max;
+  $('#hull').style.color = pilot.color;
+  $('#score').textContent = String(state.score).padStart(6, '0');
+  $('#time').textContent = formatTime(state.time);
+  $('#status').textContent = pilot.hp <= 0 ? 'DOWNED / TEAMMATE NEEDED' : 'SQUAD ONLINE';
+  $('#build').textContent = state.players.length + ' PILOTS';
+  $('#modcount').textContent = pilot.mods.length + ' INSTALLED';
+  const mods = pilot.mods.map(n => '<span class="mod">' + esc(n) + '</span>').join('') || '<span class="emptymod">Survive a sector to choose your upgrade</span>';
+  if (mods !== modsHTML) { modsHTML = mods; $('#mods').innerHTML = mods; }
+}
+function renderLobby(state, me) {
+  const cards = state.players.map(a => '<div class="pilotcard" style="border-color:' + a.color + '"><b style="color:' + a.color + '">' + esc(a.name) + '</b>' + (a.id === me ? 'YOU · ' : '') + (a.id === state.host ? 'HOST' : 'READY') + '</div>').join('');
+  overlay.innerHTML = '<div class="eyebrow">SQUAD ASSEMBLING / ' + state.players.length + ' OF 4</div><h2>ROOM ' + esc(state.code) + '</h2><p>Share this code and the server address with your squad.</p>'
+    + '<div class="squad">' + cards + '</div>' + (state.host === me ? '<button class="primary" id="startSquad">LAUNCH SQUAD</button>' : '<p>Waiting for the host to launch.</p>')
+    + '<p style="margin-top:20px">Stay near a downed teammate for 3 seconds to revive.' + (peer ? ' Host: keep this tab visible.' : '') + '</p>';
+  if ($('#startSquad')) $('#startSquad').onclick = () => send({ type: 'start' });
+}
+function renderUpgrade(pilot) {
+  const choices = pilot.offers.map((id, i) => '<button class="choice" data-netchoice="' + i + '"><small>0' + (i + 1) + '</small><b>' + descriptions[id][0] + '</b><span>' + descriptions[id][1] + '</span></button>').join('');
+  overlay.innerHTML = '<div class="eyebrow">SECTOR CLEARED</div><h2>UPGRADE YOUR SHIP.</h2>'
+    + (pilot.chosen ? '<p>Upgrade installed. Waiting for your squad.</p>' : '<p>Choose one. The next sector starts when everyone is ready.</p><div class="choices">' + choices + '</div>');
+  document.querySelectorAll('[data-netchoice]').forEach(b => b.onclick = () => send({ type: 'choose', index: +b.dataset.netchoice }));
+}
+function renderDefeat(state, me) {
+  overlay.innerHTML = '<div class="eyebrow">SQUAD LOST</div><h2>THE VOID TAKES EVERYONE.</h2><p>Sector ' + state.wave + ' · ' + state.score + ' points · ' + formatTime(state.time) + '</p>'
+    + (state.host === me ? '<button id="restartSquad" class="primary">RUN IT BACK</button>' : '<p>Waiting for the host to restart.</p>');
+  if ($('#restartSquad')) $('#restartSquad').onclick = () => send({ type: 'start' });
+}
+
+// Journal effects. Only the frame loop retires particles, and hidden tabs stop it, so effects
+// nobody can see are skipped.
+function showEffect(e) {
+  if (document.hidden) return;
+  if (e.kind === 'burst') { burst(e.x, e.y, e.color, e.count); return; }
+  flash.set(e.target, { until: performance.now() + HIT_FLASH_MS, color: e.color });
+  if (e.mine) tone(1200, .025, 'triangle', .012);
+  if (!e.at) return;
+  damageText.push({ x: e.at.x, y: e.at.y, damage: Math.round(e.damage * 10) / 10, color: e.color, life: .5 });
+  for (let i = 0; i < 6; i++) particles.push({ x: e.at.x, y: e.at.y, vx: random(-80, 80), vy: random(-90, 20), life: .2, color: e.color, size: 3 });
+}
+function readInput() {
+  return { left: !!keys.ArrowLeft, right: !!keys.ArrowRight, up: !!keys.ArrowUp, down: !!keys.ArrowDown, fire: !!keys.Space };
+}
+
+window.netHelp = () => {
+  if (client?.view?.phase === 'play') announce('ARROWS + SPACE / STAY NEAR DOWNED PILOTS TO REVIVE / ONLINE DOES NOT PAUSE');
+};
+window.netUpdate = dt => {
+  const now = performance.now();
+  for (const s of stars) s.y = (s.y + s.z * 25 * dt) % H;
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  shake = Math.max(0, shake - dt * 30);
+  damageText = damageText.filter(d => (d.life -= dt) > 0);
+  for (const d of damageText) d.y -= 35 * dt;
+  muzzle = Math.max(0, muzzle - dt);
+  for (const [id, f] of flash) if (f.until < now) flash.delete(id);
+  if (!client) return;
+  if (client.update(dt, document.hidden ? null : readInput(), now)) { muzzle = .06; tone(780, .04); }
+  peer?.pulse(now);
+};
+window.netDraw = () => {
+  ctx.fillStyle = '#080c18';
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  if (shake) ctx.translate(random(-shake, shake), random(-shake, shake));
+  for (const s of stars) { ctx.fillStyle = s.z > 1.1 ? '#7e93ad' : '#293b55'; ctx.fillRect(s.x | 0, s.y | 0, 2, 2); }
+  if (client?.view) {
+    const now = performance.now(), scene = client.scene(now);
+    for (const p of scene.pilots) drawPilot(p, client.me);
+    for (const e of scene.enemies) drawEnemy(e, now);
+    for (const b of scene.bullets) { ctx.fillStyle = b.color; ctx.fillRect(b.x - 2, b.y - 8, 4, 13); }
+    ctx.fillStyle = '#ff799a';
+    for (const s of scene.shots) ctx.fillRect(s.x - 3, s.y - 3, 6, 6);
+  }
+  for (const p of particles) { ctx.globalAlpha = Math.min(1, p.life * 3); ctx.fillStyle = p.color; ctx.fillRect(p.x | 0, p.y | 0, p.size | 0, p.size | 0); }
+  ctx.globalAlpha = 1;
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  for (const d of damageText) { ctx.fillStyle = d.color; ctx.fillText('-' + d.damage, d.x, d.y); }
+  const ship = client?.predicted;
+  if (muzzle > 0 && ship) { ctx.fillStyle = ship.color; ctx.fillRect(ship.x - 5, ship.y - 30, 10, 10); }
+  ctx.restore();
+};
+function drawPilot(p, me) {
+  if (p.hp <= 0) {
+    ctx.strokeStyle = p.color;
+    ctx.strokeRect(p.x - 17, p.y - 17, 34, 34);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 20, p.y + 25, 40 * p.revive / 3, 4);
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('REVIVE', p.x, p.y - 26);
+    return;
+  }
+  // Blinks while invulnerable.
+  if (p.inv <= 0 || Math.floor(p.inv * 12) % 2 === 0) {
+    ctx.fillStyle = '#ffb35f';
+    ctx.fillRect(p.x - 5, p.y + 15, 8, random(8, 18));
+    sprite('ship', p.x, p.y, 3, [p.color, '#e8f4ff']);
+  }
+  ctx.fillStyle = p.color;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 12px monospace';
+  ctx.fillText(p.name + (p.id === me ? ' · YOU' : ''), p.x, p.y + 40);
+  if (p.id === me) { ctx.strokeStyle = p.color; ctx.strokeRect(p.x - 20, p.y - 21, 40, 47); }
+}
+function drawEnemy(e, now) {
+  const hit = flash.get(e.id);
+  const palette = hit?.until > now ? ['#ffffff', hit.color] : e.type === 'boss' ? ['#986148', '#ffc16f'] : ['#9e405a', '#ff8790'];
+  sprite(e.type, e.x, e.y, ENEMY_SCALE[e.type], palette);
+  if (e.type === 'boss') {
+    ctx.fillStyle = '#402c32';
+    ctx.fillRect(260, 18, 440, 7);
+    ctx.fillStyle = '#ff9272';
+    ctx.fillRect(260, 18, 440 * e.hp / e.max, 7);
+  }
+}
+
+window.addEventListener('keydown', e => {
+  if (!window.netActive || e.repeat || ['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (['Digit1', 'Digit2', 'Digit3'].includes(e.code) && client?.view?.phase === 'upgrade') send({ type: 'choose', index: +e.code.slice(-1) - 1 });
+});
+// Losing focus releases every key so the ship doesn't keep flying.
+const releaseKeys = () => { keys = {}; send({ type: 'input', input: {} }); };
+window.addEventListener('blur', releaseKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(); });
+window.netDiagnostics = () => ({ transport: peer ? 'peer' : 'server', ...client?.diagnostics() });
+$('#online').onclick = openOnline;
 })();
 
 }

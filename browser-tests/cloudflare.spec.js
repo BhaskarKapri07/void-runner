@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { WebSocket } from 'ws';
+import { PROTOCOL } from '../shared/protocol.js';
 const client=pathToFileURL(path.resolve('downloads/voidrunner.html')).href+'?server=http://127.0.0.1:8787';
 for(const mode of ['server','peer'])test(`Cloudflare Durable Object: four local HTML clients in ${mode} mode`,async({browser,request})=>{
  const pages=[],errors=[];try{
@@ -13,9 +14,12 @@ for(const mode of ['server','peer'])test(`Cloudflare Durable Object: four local 
  }catch(error){for(const p of pages)console.log('CLIENT FAILURE',await p.evaluate(()=>({text:document.body.innerText,diagnostics:window.netDiagnostics?.()})));throw error;}finally{for(const p of pages)await p.close()}
  await expect.poll(async()=>{const r=await request.get('http://127.0.0.1:8787/health');const h=await r.json();return h.rooms+h.peerRooms}).toBe(0);
 });
-test('Cloudflare Durable Object: messages after leave cannot create rooms',async({request})=>{
+test('Cloudflare Durable Object: no room outlives the socket that created it',async({request})=>{
+ const rooms=async()=>(await (await request.get('http://127.0.0.1:8787/health')).json()).rooms;
  const ws=new WebSocket('ws://127.0.0.1:8787/');await new Promise((resolve,reject)=>{ws.once('open',resolve);ws.once('error',reject)});
- ws.send(JSON.stringify({type:'leave'}));ws.send(JSON.stringify({type:'create',name:'Ghost',v:2}));
- await new Promise(resolve=>ws.once('close',resolve));
- await expect.poll(async()=>(await (await request.get('http://127.0.0.1:8787/health')).json()).rooms).toBe(0);
+ // Leaving and creating again on one socket, then closing it, must not leave a room (and its 60 Hz clock) behind.
+ ws.send(JSON.stringify({type:'leave'}));ws.send(JSON.stringify({type:'create',name:'Ghost',v:PROTOCOL}));
+ await expect.poll(rooms).toBe(1);
+ ws.close();
+ await expect.poll(rooms).toBe(0);
 });
