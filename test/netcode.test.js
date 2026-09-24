@@ -131,3 +131,15 @@ test('direct mode: a dropped signaling socket does not remove a pilot whose data
  guest.peers.get('H').control.readyState='closed';await guest.message({type:'peer-ended',message:'Host left.'});assert.deepEqual(failures,['Host left.']);
  host.close();guest.close();
 });
+
+test('direct mode: a roster change travels with its state on the reliable channel',async()=>{
+ const host=new PeerSession(()=>{},()=>{},()=>{});host.name='Host';await host.message({type:'peer-ready',peer:'H',host:'H',code:'PABCDE'});
+ const channel=()=>({readyState:'open',bufferedAmount:0,sent:[],send(text){this.sent.push(JSON.parse(text).type)}}),e={pc:{close(){}},control:channel(),state:channel(),player:host.room.add('B').id,needSync:false};
+ host.peers.set('B',e);host.publish();
+ // Ticks are frozen in the lobby, so this state is the only one carrying the new pilot's ship.
+ assert.deepEqual(e.control.sent,['rel','state']);assert.deepEqual(e.state.sent,[]);
+ host.room.start(host.player);host.publish();e.control.sent=[];e.state.sent=[];
+ host.room.tick(STEP);host.room.tick(STEP);host.publish();
+ assert.deepEqual(e.state.sent,['state'],'ordinary play states stay on the unreliable channel');
+ host.close();
+});

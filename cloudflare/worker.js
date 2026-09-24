@@ -42,6 +42,8 @@ export class Arena extends DurableObject {
     if(!this.clients.size&&this.idleTimer){clearInterval(this.idleTimer);this.idleTimer=null;}
   }
   message(c,raw){
+    // Messages can still arrive after leave() on a socket that is closing; they must not create rooms or pilots.
+    if(!this.clients.has(c))return;
     c.lastSeen=Date.now();if(typeof raw!=='string'||raw.length>16384){c.ws.close(1009,'Message too large');this.leave(c);return;}
     if(Date.now()-c.windowStart>1000){c.count=0;c.windowStart=Date.now()}if(++c.count>90){c.ws.close(1008,'Too many messages');this.leave(c);return;}
     try{const m=JSON.parse(raw);if(!m||typeof m!=='object')return;

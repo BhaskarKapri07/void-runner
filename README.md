@@ -62,7 +62,7 @@ The match authority (a player's browser, the Node server, or the Cloudflare Dura
 - **Journal, reliable and sent once:** volleys, enemy shot spreads, projectile removals from hits, hit and explosion effects, and roster or upgrade changes. Projectiles fly in straight lines, so a whole volley is one small entry and each client computes every bullet's position itself.
 - **State, latest only:** ships, enemies and score. Losing one is harmless because the next one replaces it.
 
-Over WebSocket both parts travel in one message. In direct mode the journal uses the reliable data channel and state uses the unreliable one. A client that misses a journal batch asks for a full sync, and an authority that has to skip a batch for a backed-up connection sends one on its own. Each message is encoded once and shared by every player in the room.
+Over WebSocket both parts travel in one message. In direct mode the journal uses the reliable data channel and state uses the unreliable one. A client that misses a journal batch asks for a full sync. The Node server and the browser host also send one on their own when they have to skip a batch for a backed-up connection. Each message is encoded once and shared by every player in the room.
 
 Four pilots now need roughly 0.1 to 0.3 Mbit/s each, and that no longer grows with the number of bullets on screen. Protocol v1 sent every entity plus the last 160 effects in every snapshot, which reached about 37 Mbit/s per player late in a run. `npm run bench:net` prints before and after numbers for several builds from the same simulation.
 

@@ -59,7 +59,7 @@ function applyState(now){
 }
 
 function error(message){if(!state){const el=$('#neterror');if(el)el.textContent=message;const c=$('#createRoom'),j=$('#joinRoom');if(c)c.disabled=false;if(j)j.disabled=false;return}overlay.classList.remove('hidden');overlay.innerHTML='<div class="eyebrow">CONNECTION INTERRUPTED</div><h2>SIGNAL LOST.</h2><p class="online-note">'+esc(message)+'</p><button id="netReturn">RETURN TO LOBBY</button>';$('#netReturn').onclick=leave;}
-function leave(){session++;rawSend({type:'leave'});peer?.close();peer=null;socket?.close();socket=null;state=null;me=null;world.reset();keys={};particles=[];openOnline()}
+function leave(){session++;rawSend({type:'leave'});peer?.close();peer=null;socket?.close();socket=null;state=null;me=null;predicted=null;pending=[];batch=[];world.reset();keys={};particles=[];openOnline()}
 function renderUI(){if(!state||!me)return;const p=state.players.find(p=>p.id===me);if(!p)return;const html='<span>ROOM <b>'+esc(state.code)+'</b> · '+(peer?'DIRECT':'SERVER')+' · '+rtt+' ms</span><div class="roster">'+state.players.map(a=>'<span style="color:'+a.color+'">'+esc(a.name)+(a.id===me?' (YOU)':'')+' '+(a.hp>0?a.hp+'/'+a.max:'DOWN')+'</span>').join('')+'</div><button id="leaveRoom">LEAVE ROOM</button>';if(html!==barHTML){barHTML=html;bar.innerHTML=html;$('#leaveRoom').onclick=leave}
 $('#wave').textContent=String(state.wave).padStart(2,'0');$('#hull').textContent=p.hp+' / '+p.max;$('#hull').style.color=p.color;$('#score').textContent=String(state.score).padStart(6,'0');$('#time').textContent=formatTime(state.time);$('#status').textContent=p.hp<=0?'DOWNED / TEAMMATE NEEDED':'SQUAD ONLINE';$('#build').textContent=state.players.length+' PILOTS';$('#modcount').textContent=p.mods.length+' INSTALLED';const mods=p.mods.map(n=>'<span class="mod">'+esc(n)+'</span>').join('')||'<span class="emptymod">Survive a sector to choose your upgrade</span>';if(mods!==modsHTML){modsHTML=mods;$('#mods').innerHTML=mods}
 const key=[state.phase,state.host,state.players.map(a=>a.id+':'+a.chosen).join(','),p.chosen,state.wave].join('/');if(key===uiKey)return;uiKey=key;
@@ -78,7 +78,7 @@ window.netUpdate=dt=>{
   for(let n=0;n<steps;n++){const input={left:!!keys.ArrowLeft,right:!!keys.ArrowRight,up:!!keys.ArrowUp,down:!!keys.ArrowDown,fire:!!keys.Space};const frame={seq:++seq,input};pending.push(frame);batch.push(frame);
    // Same per-frame cooldown as the authority, so the volley shown now is the one the server will fire.
    if(stepShip(predicted,input)){muzzle=.06;tone(780,.04);world.predict(seq,predicted.x,predicted.y-20,predicted.spread,own-(steps-1-n))}}}else stepCarry=0;
- inputTime+=dt;if(inputTime>=1/30){inputTime=0;if(batch.length)send(encodeFrames(state.epoch,batch.splice(0,12)))}
+ inputTime+=dt;if(inputTime>=1/30){inputTime=0;if(batch.length&&state)send(encodeFrames(state.epoch,batch.splice(0,12)))}
  peer?.pulse();
  if(now-pingAt>1000){pingAt=now;send({type:'ping',sent:now})}
 };

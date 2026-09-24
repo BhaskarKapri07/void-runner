@@ -73,7 +73,8 @@ export class PeerSession {
     for(const e of this.peers.values()){if(!e.player)continue;
       if(e.needSync||resync){sync??=this.broadcaster.sync();syncText??=JSON.stringify(sync);if(this.write(e.control,syncText))e.needSync=false;continue}
       if(rel&&!this.write(e.control,relText??=JSON.stringify(rel)))e.needSync=true;
-      if(hot)this.write(e.state,hotText??=JSON.stringify(hot));
+      // With ticks frozen (lobby, upgrades) the state sent with a roster change is the only one, so it can't be lossy.
+      if(hot)this.write(rel?.meta?e.control:e.state,hotText??=JSON.stringify(hot));
     }
     if(this.localSync||resync){this.localSync=false;this.receive(sync??this.broadcaster.sync())}else{if(rel)this.receive(rel);if(hot)this.receive(hot)}
   }

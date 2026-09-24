@@ -24,5 +24,15 @@ test('peer: host keeps simulating for guests when its animation frames stop',asy
  const before=await guest.evaluate(()=>window.netDiagnostics());await guest.keyboard.down('ArrowRight');await guest.waitForTimeout(300);await guest.keyboard.up('ArrowRight');await guest.waitForTimeout(300);
  const after=await guest.evaluate(()=>window.netDiagnostics()),start=before.players.find(p=>p.id===before.me),end=after.players.find(p=>p.id===after.me);
  expect(end.x).toBeGreaterThan(start.x+40);expect(Math.abs(end.x-after.predicted.x)).toBeLessThan(12);expect(errors).toEqual([]);
- }finally{for(const p of pages)await p.close()}
+ }catch(error){for(const p of pages)console.log('CLIENT FAILURE',JSON.stringify(await p.evaluate(()=>window.netDiagnostics?.())));throw error;}finally{for(const p of pages)await p.close()}
+});
+test('server: leaving mid-run returns to a working lobby',async({page})=>{
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('http://127.0.0.1:3000/');await page.locator('#online').click();await page.locator('#hostmode').selectOption('server');
+ await page.locator('#createRoom').click();await expect(page.locator('#startSquad')).toBeVisible();await page.locator('#startSquad').click();
+ await expect.poll(()=>page.evaluate(()=>window.netDiagnostics().phase)).toBe('play');
+ // Input frames are still queued when the pilot leaves; the next send used to throw and stop the game loop.
+ await page.keyboard.down('ArrowRight');await page.waitForTimeout(100);await page.locator('#leaveRoom').click();await page.waitForTimeout(300);await page.keyboard.up('ArrowRight');
+ expect(errors).toEqual([]);
+ await page.locator('#createRoom').click();await expect(page.locator('#startSquad')).toBeVisible();expect(errors).toEqual([]);
 });
